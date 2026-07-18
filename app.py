@@ -611,10 +611,9 @@ def simple_company_data_panel(project: dict | None) -> None:
                 set_active_project(existing_id)
                 st.session_state.pop("simple_company_preview", None)
                 st.session_state[f"auto_financial_fetch_{existing_id}"] = True
-                st.session_state.current_page = "PL・業績予想"
                 st.session_state.simple_lookup_feedback = (
                     "success",
-                    f"{existing.get('company_name') or existing.get('project_name') or normalized_code}（{normalized_code}）を開き、PL・セグメントの取得を開始します。",
+                    f"{existing.get('company_name') or existing.get('project_name') or normalized_code}（{normalized_code}）を開きました。PL・業績予想を選ぶと、PL・セグメントの取得候補を表示します。",
                 )
                 st.rerun()
 
@@ -650,8 +649,7 @@ def simple_company_data_panel(project: dict | None) -> None:
                 })
                 set_active_project(project_id)
                 st.session_state[f"auto_financial_fetch_{project_id}"] = True
-                st.session_state.current_page = "PL・業績予想"
-                message = f"{company_name or normalized_code}のプロジェクトを作成しました。会社概要とPL・セグメントを入力できます。"
+                message = f"{company_name or normalized_code}のプロジェクトを作成しました。この画面のまま会社概要を確認・編集できます。PL・業績予想を選ぶと取得候補を表示します。"
                 if master_warning:
                     message += " JPX企業マスターは取得できなかったため、会社名は手入力してください。"
                 st.session_state.simple_lookup_feedback = ("success", message)
@@ -704,8 +702,7 @@ def simple_company_data_panel(project: dict | None) -> None:
                 save_structured_pl(project_id, pl_records)
             set_active_project(project_id)
             st.session_state[f"auto_financial_fetch_{project_id}"] = True
-            st.session_state.current_page = "PL・業績予想"
-            st.success("確認したデータを反映し、PL・セグメントの取得を開始します。")
+            st.success("確認したデータを反映しました。現在の画面は切り替えません。PL・業績予想を選ぶと、PL・セグメントの取得候補を表示します。")
             st.rerun()
 
 
