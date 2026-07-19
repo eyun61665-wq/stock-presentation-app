@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import date
+import os
 import unicodedata
 from typing import Any
 
@@ -48,6 +49,7 @@ from pdf_extractor import (
     SEGMENT_KEYWORDS,
     extract_pdf_candidates,
 )
+from pl_import_service import acquire_pl_candidates, merge_with_existing
 
 
 PL_INPUT_COLUMNS = {
@@ -191,6 +193,124 @@ def _pl_records_from_editor(frame: pd.DataFrame) -> list[dict[str, Any]]:
             continue
         rows.append(row)
     return rows
+
+
+def _jquants_api_key() -> str | None:
+    """APIキーは環境変数またはSecretsから読み、画面やDBへ保存しない。"""
+    key = os.getenv("JQUANTS_API_KEY")
+    if key:
+        return key
+    try:
+        return st.secrets.get("JQUANTS_API_KEY")
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl="6h", max_entries=50, show_spinner=False)
+def _cached_pl_candidates(
+    stock_code: str,
+    company_name: str,
+    ir_url: str,
+    api_key: str | None,
+) -> dict[str, Any]:
+    result = acquire_pl_candidates(
+        stock_code,
+        company_name,
+        saved_ir_url=ir_url,
+        jquants_api_key=api_key,
+    )
+    return {
+        "records": result.records,
+        "warnings": result.warnings,
+        "sources": result.sources,
+        "ir_url": result.ir_url,
+    }
+
+
+def _pl_candidate_frame(records: list[dict[str, Any]]) -> pd.DataFrame:
+    rows = []
+    for row in records:
+        rows.append({
+            "反映": True,
+            "年度名": row.get("fiscal_year"),
+            "区分": normalize_result_type(row.get("result_type")),
+            "売上高": row.get("sales"),
+            "売上原価": row.get("cost_of_sales"),
+            "販管費": row.get("sga_expenses"),
+            "営業利益": row.get("operating_profit"),
+            "経常利益": row.get("ordinary_profit"),
+            "当期純利益": row.get("net_income"),
+            "EPS": row.get("reported_eps", row.get("eps")),
+            "平均株式数": row.get("shares_outstanding", row.get("average_shares")),
+            "出典": row.get("source", ""),
+            "基準日": row.get("basis_date", ""),
+        })
+    return pd.DataFrame(rows)
+
+
+def _pl_import_panel(project: dict[str, Any], existing: list[dict[str, Any]]) -> None:
+    project_id = int(project["id"])
+    preview_key = f"pl_import_preview_{project_id}"
+    stock_code = str(project.get("stock_code") or "").strip()
+    company_name = str(project.get("company_name") or project.get("project_name") or "").strip()
+    with st.container(border=True):
+        st.markdown("**過去3期のPLと会社予想を取得**")
+        st.caption("企業公式の決算資料を優先し、設定済みの場合のみJ-Quantsで不足を補います。確認するまで保存しません。")
+        if not stock_code:
+            st.info("銘柄概要で4桁の証券コードを保存すると、PL候補を取得できます。")
+        elif st.button("PL候補を取得", icon=":material/download:", key=f"fetch_pl_{project_id}"):
+            with st.spinner("決算資料と財務データを確認しています…"):
+                st.session_state[preview_key] = _cached_pl_candidates(
+                    stock_code,
+                    company_name,
+                    str(project.get("ir_url") or ""),
+                    _jquants_api_key(),
+                )
+
+        preview = st.session_state.get(preview_key)
+        if not preview:
+            return
+        for warning in preview.get("warnings", []):
+            st.caption(f"・{warning}")
+        records = preview.get("records", [])
+        if not records:
+            st.warning("取得できるPL候補がありませんでした。下のPDF候補検索または手入力を利用できます。")
+            return
+        if preview.get("sources"):
+            st.caption(f"取得元：{' / '.join(preview['sources'])}")
+        edited = st.data_editor(
+            _pl_candidate_frame(records),
+            hide_index=True,
+            key=f"pl_import_editor_{project_id}",
+            column_config={
+                "反映": st.column_config.CheckboxColumn("反映"),
+                "区分": st.column_config.SelectboxColumn("区分", options=["実績", "会社予想", "自分予想"]),
+                **{column: st.column_config.NumberColumn(column) for column in (
+                    "売上高", "売上原価", "販管費", "営業利益", "経常利益", "当期純利益", "EPS", "平均株式数"
+                )},
+            },
+        )
+        overwrite = st.checkbox(
+            "同じ年度の保存済み数値も取得値で更新する",
+            value=False,
+            key=f"pl_import_overwrite_{project_id}",
+            help="オフの場合、保存済みの手入力値を残し、空欄だけを補完します。",
+        )
+        if st.button("確認した候補をPLへ反映", type="primary", key=f"apply_pl_import_{project_id}"):
+            selected = edited[edited["反映"].fillna(False)].drop(columns=["反映"])
+            selected["_placeholder"] = False
+            selected["_id"] = None
+            imported = _pl_records_from_editor(selected)
+            if not imported:
+                st.warning("反映する年度を1つ以上選択してください。")
+            else:
+                save_pl_entries(project_id, merge_with_existing(existing, imported, overwrite=overwrite))
+                discovered_ir = str(preview.get("ir_url") or "")
+                if discovered_ir and not project.get("ir_url"):
+                    save_project({**project, "ir_url": discovered_ir})
+                st.session_state.pop(preview_key, None)
+                st.success("確認したPLを保存しました。")
+                st.rerun()
 
 
 def _merge_by_period(existing: list[dict], edited: list[dict]) -> list[dict]:
@@ -400,6 +520,7 @@ def _pl_tab(project: dict, data: dict, edit_mode: bool) -> None:
     draft_key = f"mvp_pl_draft_{project_id}"
     st.caption(f"金額単位：{settings.get('pl_unit', '百万円')}。実績・会社予想・独自予想を分けて管理します。")
     if edit_mode:
+        _pl_import_panel(project, entries)
         _pdf_panel(project_id, "pl", f"pdf_pl_selected_{project_id}")
         unit_options = ["円", "千円", "百万円", "億円", "その他"]
         selected_unit = st.selectbox("金額単位", unit_options, index=unit_options.index(settings.get("pl_unit", "百万円")) if settings.get("pl_unit", "百万円") in unit_options else 4)
@@ -429,6 +550,8 @@ def _pl_tab(project: dict, data: dict, edit_mode: bool) -> None:
                 save_project_mvp_data(project_id, settings={**settings, "pl_unit": unit})
                 st.success("PLを保存しました。")
                 st.rerun()
+    elif not entries:
+        st.info("このプロジェクトには保存済みPLがありません。編集モードでPL候補を取得するか、表へ入力してください。")
     matrix = _pl_matrix(get_pl_entries(project_id))
     st.dataframe(matrix, hide_index=True, column_config={"項目": st.column_config.TextColumn("項目", pinned=True)})
     calculated = [_pl_calculated(row) for row in _five_period_records(get_pl_entries(project_id))]
