@@ -152,3 +152,23 @@ def test_confirmed_import_replaces_actual_year_only():
     assert {(row["fiscal_year"], row["segment_name"]) for row in merged_segments} == {
         ("2025-05-31", "新"), ("2027-05-31", "予想")
     }
+
+
+def test_imported_blank_does_not_erase_manual_pl_value():
+    existing = [{
+        "fiscal_year": "2025-05-31",
+        "result_type": "実績",
+        "sales": 100,
+        "ordinary_profit": 12,
+    }]
+    imported = [{
+        "fiscal_year": "2025-05-31",
+        "result_type": "実績",
+        "sales": 110,
+        "ordinary_profit": None,
+    }]
+
+    merged = merge_imported_pl(existing, imported)
+
+    assert merged[0]["sales"] == 110
+    assert merged[0]["ordinary_profit"] == 12

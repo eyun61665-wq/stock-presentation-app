@@ -118,10 +118,15 @@ def load_official_financials(
 
 
 def merge_imported_pl(existing: list[dict], imported: list[dict]) -> list[dict]:
-    """確認済みの実績年度だけを差し替え、予想と他年度を残す。"""
+    """取得した実績値を統合し、空欄で手入力値を消さない。"""
     by_key = {(str(row["fiscal_year"]), str(row.get("result_type", "実績"))): dict(row) for row in existing}
     for row in imported:
-        by_key[(str(row["fiscal_year"]), "実績")] = dict(row)
+        key = (str(row["fiscal_year"]), "実績")
+        merged = dict(by_key.get(key, {}))
+        merged.update({field: value for field, value in row.items() if value not in (None, "")})
+        merged["fiscal_year"] = str(row["fiscal_year"])
+        merged["result_type"] = "実績"
+        by_key[key] = merged
     return [by_key[key] for key in sorted(by_key)]
 
 

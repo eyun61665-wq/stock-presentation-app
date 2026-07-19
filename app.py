@@ -732,8 +732,36 @@ def _uploaded_financial_result(files: list) -> dict:
     }
 
 
+def _apply_financial_result(project_id: int, result: dict, location: str) -> int:
+    """取得結果のうち、開いている画面の表だけをSQLiteへ反映する。"""
+    if location == "pl":
+        records = result.get("pl_records", [])
+        if not records:
+            return 0
+        save_pl_entries(project_id, merge_imported_pl(get_pl_entries(project_id), records))
+        st.session_state.pop(f"pl_years_state_{project_id}", None)
+        clear_state_prefix(f"pl_matrix_simple_{project_id}")
+        clear_state_prefix(f"pl_matrix_mobile_{project_id}")
+        return len(records)
+
+    records = result.get("segment_records", [])
+    if not records:
+        return 0
+    save_segment_entries(
+        project_id,
+        merge_imported_segments(get_segment_entries(project_id), records),
+    )
+    st.session_state.pop(f"segment_years_state_{project_id}", None)
+    st.session_state.pop(f"segment_names_state_{project_id}", None)
+    clear_state_prefix(f"segment_sales_simple_{project_id}")
+    clear_state_prefix(f"segment_profit_simple_{project_id}")
+    clear_state_prefix(f"segment_combined_simple_{project_id}")
+    clear_state_prefix(f"segment_combined_mobile_{project_id}")
+    return len(records)
+
+
 def financial_document_import_panel(project: dict, location: str) -> None:
-    """決算短信の取得・プレビュー・PLとセグメントへの確認反映を1か所にまとめる。"""
+    """PLまたはセグメントを、画面ごとの1回の操作で取得・反映する。"""
     project_id = int(project["id"])
     preview_key = f"financial_document_preview_{project_id}"
     source_key = f"financial_document_source_{project_id}"
@@ -742,27 +770,39 @@ def financial_document_import_panel(project: dict, location: str) -> None:
     company_name = str(project.get("company_name") or project.get("project_name") or "").strip()
     saved_url = str(project.get("ir_url") or "").strip()
 
+    target_label = "PL" if location == "pl" else "セグメント"
+    notice_key = f"financial_import_notice_{location}_{project_id}"
+    notice = st.session_state.pop(notice_key, None)
+    if notice:
+        st.success(notice, icon=":material/check_circle:")
+
     with st.container(border=True):
-        st.markdown("#### 決算短信からPL・セグメントを自動入力")
-        st.caption("銘柄コードから企業公式IRを自動で探し、本決算短信の連結PLと報告セグメントを抽出します。確認するまで数値は保存しません。")
+        heading, action = responsive_columns([4, 1], vertical_alignment="center")
+        heading.markdown(f"#### 決算短信から{target_label}を自動入力")
+        heading.caption("銘柄コードから公式IRを探し、本決算短信の連結データを表へ直接反映します。")
         source_info = st.session_state.get(source_key)
         source_url = (source_info or {}).get("url") or saved_url
         if source_url:
             source_method = (source_info or {}).get("method", "保存済み公式IR")
-            st.markdown(f"取得先：[{company_name or stock_code} 公式IR]({source_url})　:gray-badge[{source_method}]")
-        else:
-            st.caption("取得ボタンを押すと、公式の決算短信掲載ページを自動探索します。")
-        with st.popover("取得設定", icon=":material/settings:"):
+            heading.caption(f"取得先：{company_name or stock_code} 公式IR（{source_method}）")
+        with heading.popover("その他", icon=":material/settings:"):
             refresh_source = st.checkbox(
-                "公式IRの取得先とキャッシュを更新する",
+                "取得先とキャッシュを更新する",
                 key=f"document_refresh_{location}_{project_id}",
             )
-            st.caption("通常はオフのままで取得できます。資料が更新されない時だけオンにします。")
-        fetch_clicked = st.button(
-            "PL・セグメントを取得",
+            st.caption("最新資料が出た直後など、通常取得で更新されない時だけオンにします。")
+            uploaded = st.file_uploader(
+                "自動取得できない場合：本決算短信PDF（複数可）",
+                type=["pdf"],
+                accept_multiple_files=True,
+                key=f"document_upload_{location}_{project_id}",
+            )
+        fetch_clicked = action.button(
+            f"{target_label}情報を取得",
             type="primary",
             icon=":material/travel_explore:",
             key=f"document_fetch_{location}_{project_id}",
+            width="stretch",
         )
         auto_fetch = bool(st.session_state.pop(f"auto_financial_fetch_{project_id}", False))
         if fetch_clicked or auto_fetch:
@@ -789,101 +829,47 @@ def financial_document_import_panel(project: dict, location: str) -> None:
                         )
                     st.session_state[preview_key] = result
                 save_project({"id": project_id, "ir_url": source_info["url"]})
-                st.toast("PL・セグメント候補を取得しました。", icon=":material/check_circle:")
+                count = _apply_financial_result(project_id, result, location)
+                if count:
+                    unit = "年度" if location == "pl" else "行"
+                    st.session_state[notice_key] = f"{target_label}を{count}{unit}取得し、下の表へ反映しました。"
+                    st.rerun()
+                if location == "segment" and result.get("pl_records"):
+                    st.warning("PLは取得できましたが、この資料からセグメント数値を安全に抽出できませんでした。")
+                else:
+                    st.warning(f"{target_label}を資料から抽出できませんでした。下の表へ手入力できます。")
             except (IRSourceDiscoveryError, DataSourceError, ValueError, OSError) as exc:
                 try:
+                    if location != "pl":
+                        raise ValueError("公式IRからセグメントを取得できませんでした。")
                     with st.spinner("J-QuantsのPLへ切り替えています…"):
-                        st.session_state[preview_key] = jquants_financial_fallback(stock_code, time.time_ns() if refresh_source else 0)
-                    st.warning("公式IRから取得できなかったため、J-QuantsのPLへ切り替えました。")
+                        result = jquants_financial_fallback(stock_code, time.time_ns() if refresh_source else 0)
+                        st.session_state[preview_key] = result
+                    count = _apply_financial_result(project_id, result, location)
+                    if count:
+                        st.session_state[notice_key] = f"J-QuantsからPLを{count}年度取得し、下の表へ反映しました。"
+                        st.rerun()
+                    st.warning("公式IRとJ-QuantsのどちらからもPLを取得できませんでした。")
                 except (DataSourceError, JQuantsApiError, ValueError) as fallback_exc:
                     st.error(f"自動取得できませんでした：{fallback_exc}")
 
-        uploaded = st.file_uploader(
-            "自動取得できない場合のみ、本決算短信PDFをアップロード（複数可）",
-            type=["pdf"],
-            accept_multiple_files=True,
-            key=f"document_upload_{location}_{project_id}",
-        )
         upload_signature = tuple((item.name, item.size) for item in uploaded)
         if uploaded and upload_signature != st.session_state.get(upload_signature_key):
             with st.spinner("アップロードしたPDFを解析しています…"):
-                st.session_state[preview_key] = _uploaded_financial_result(uploaded)
+                result = _uploaded_financial_result(uploaded)
+                st.session_state[preview_key] = result
                 st.session_state[upload_signature_key] = upload_signature
+            count = _apply_financial_result(project_id, result, location)
+            if count:
+                unit = "年度" if location == "pl" else "行"
+                st.session_state[notice_key] = f"PDFから{target_label}を{count}{unit}取得し、下の表へ反映しました。"
+                st.rerun()
+            st.warning(f"PDFから{target_label}を安全に抽出できませんでした。下の表へ手入力できます。")
 
         preview = st.session_state.get(preview_key)
-        if not preview:
-            return
-        for warning in preview.get("warnings", []):
-            st.warning(warning)
-        imported_pl = preview.get("pl_records", [])
-        imported_segments = preview.get("segment_records", [])
-        if not imported_pl and not imported_segments:
-            st.warning("PL・セグメントの候補を抽出できませんでした。別の本決算短信PDFをアップロードしてください。")
-            return
-
-        years = sorted({str(row["fiscal_year"]) for row in [*imported_pl, *imported_segments]})
-        selected_years = st.multiselect(
-            "反映する年度",
-            years,
-            default=years,
-            key=f"document_years_{location}_{project_id}",
-        )
-        if imported_pl:
-            st.markdown("##### 取得した連結PL")
-            pl_meta = [{"fiscal_year": row["fiscal_year"], "result_type": "実績"} for row in imported_pl]
-            st.dataframe(
-                color_columns(pl_display_frame(imported_pl), pl_meta),
-                hide_index=True,
-                column_config={"科目": st.column_config.TextColumn("科目", pinned=True)},
-            )
-        if imported_segments:
-            st.markdown("##### 取得したセグメント")
-            segment_meta = [
-                {"fiscal_year": year, "result_type": "実績"}
-                for year in sorted({str(row["fiscal_year"]) for row in imported_segments})
-            ]
-            left, right = responsive_columns(2)
-            left.caption("外部顧客への売上高")
-            left.dataframe(segment_display_frame(imported_segments, segment_meta, "sales"), hide_index=True)
-            right.caption("セグメント利益")
-            right.dataframe(segment_display_frame(imported_segments, segment_meta, "operating_profit"), hide_index=True)
-        else:
-            st.info("セグメント数値は資料から安全に抽出できませんでした。セグメント画面には空欄の編集表を表示します。")
-        if preview.get("documents"):
+        if preview and preview.get("documents"):
             st.caption("出典：" + " ｜ ".join(row["title"] for row in preview["documents"]))
-
-        apply_pl = st.checkbox("選択年度のPLを反映", value=bool(imported_pl), key=f"document_apply_pl_{location}_{project_id}")
-        apply_segments = st.checkbox("選択年度のセグメントを反映", value=bool(imported_segments), key=f"document_apply_segment_{location}_{project_id}")
-        if st.button("確認したデータを反映", type="primary", key=f"document_apply_{location}_{project_id}"):
-            if not selected_years:
-                st.warning("反映する年度を選択してください。")
-                return
-            if apply_pl:
-                selected_pl = [row for row in imported_pl if str(row["fiscal_year"]) in selected_years]
-                incomplete = [
-                    str(row["fiscal_year"]) for row in selected_pl
-                    if any(row.get(key) is None for key in ("sales", "operating_profit", "net_income", "shares_outstanding"))
-                ]
-                if incomplete:
-                    st.warning("一部項目が空欄の年度も、取得できた値だけ反映します：" + "、".join(incomplete))
-                save_pl_entries(project_id, merge_imported_pl(get_pl_entries(project_id), selected_pl))
-                st.session_state.pop(f"pl_years_state_{project_id}", None)
-                clear_state_prefix(f"pl_matrix_simple_{project_id}")
-                clear_state_prefix(f"pl_matrix_mobile_{project_id}")
-            if apply_segments:
-                selected_segments = [row for row in imported_segments if str(row["fiscal_year"]) in selected_years]
-                save_segment_entries(
-                    project_id,
-                    merge_imported_segments(get_segment_entries(project_id), selected_segments),
-                )
-                st.session_state.pop(f"segment_years_state_{project_id}", None)
-                st.session_state.pop(f"segment_names_state_{project_id}", None)
-                clear_state_prefix(f"segment_sales_simple_{project_id}")
-                clear_state_prefix(f"segment_profit_simple_{project_id}")
-                clear_state_prefix(f"segment_combined_simple_{project_id}")
-                clear_state_prefix(f"segment_combined_mobile_{project_id}")
-            st.success("確認したPL・セグメントを反映しました。")
-            st.rerun()
+        st.caption("資料にない項目は空欄のままです。根拠のない数値は推測しません。")
 
 
 def project_page() -> None:
@@ -900,8 +886,17 @@ def project_page() -> None:
         c4, c5 = responsive_columns(2)
         price = c4.number_input("現在株価（円）", min_value=0.0, value=number(project.get("current_price")) if project else 0.0, step=10.0)
         shares = c5.number_input("発行済株式数（百万株）", min_value=0.0, value=number(project.get("shares_outstanding")) if project else 0.0, step=0.1, format="%.2f")
-        latest = get_pl_entries(project_id)[-1] if project_id and get_pl_entries(project_id) else None
-        latest_eps = eps(float(latest["net_income"]), float(latest["shares_outstanding"])) if latest else None
+        pl_entries = get_pl_entries(project_id) if project_id else []
+        latest_eps = None
+        for latest in reversed(pl_entries):
+            net_income = latest.get("net_income")
+            average_shares = latest.get("average_shares") or latest.get("shares_outstanding")
+            if net_income is not None and average_shares is not None and number(average_shares) > 0:
+                latest_eps = eps(number(net_income), number(average_shares))
+                break
+            if latest.get("reported_eps") is not None:
+                latest_eps = number(latest.get("reported_eps"))
+                break
         valuation = valuation_snapshot(
             price,
             shares,
@@ -909,16 +904,29 @@ def project_page() -> None:
             project.get("bps") if project else None,
             project.get("annual_dividend") if project else None,
         )
-        cards = metric_slots(5)
-        for column, label, value, suffix in zip(cards, ["株価", "時価総額", "PER", "PBR", "配当利回り"], [valuation["price"], valuation["market_cap"], valuation["per"], valuation["pbr"], valuation["dividend_yield"]], ["円", "億円", "倍", "倍", "％"]):
-            column.metric(label, "取得できませんでした" if value is None else f"{value:,.2f} {suffix}")
+        if is_mobile_view():
+            cards = metric_slots(5)
+        else:
+            # 5枚を1列に詰めず、3枚＋2枚に分けて数値を省略させない。
+            cards = [*st.columns(3), *st.columns(2)]
+        values = [
+            "―" if valuation["price"] is None else f"{valuation['price']:,.0f} 円",
+            "―" if valuation["market_cap"] is None else f"{valuation['market_cap']:,.1f} 億円",
+            "―" if valuation["per"] is None else ("赤字" if valuation["per"] <= 0 else f"{valuation['per']:,.1f} 倍"),
+            "―" if valuation["pbr"] is None else f"{valuation['pbr']:,.2f} 倍",
+            "―" if valuation["dividend_yield"] is None else f"{valuation['dividend_yield']:,.2f} %",
+        ]
+        for column, label, value in zip(cards, ["株価", "時価総額", "PER", "PBR", "配当利回り"], values):
+            column.metric(label, value, border=True)
         if project and project.get("ir_url"):
             st.caption("決算短信の取得先は銘柄コードから自動設定済みです。PL・セグメント画面で再取得できます。")
-        business = st.text_area("事業内容", value=project.get("business_description", "") if project else "")
-        strengths = st.text_area("会社の強み", value=project.get("strengths", "") if project else "")
-        thesis = st.text_area("投資仮説", value=project.get("investment_thesis", "") if project else "")
-        catalysts = st.text_area("主なカタリスト", value=project.get("catalysts", "") if project else "")
-        risks = st.text_area("主なリスク", value=project.get("risks", "") if project else "")
+        business = st.text_area("事業内容", value=project.get("business_description", "") if project else "", height=90)
+        text_left, text_right = responsive_columns(2)
+        strengths = text_left.text_area("会社の強み", value=project.get("strengths", "") if project else "", height=100)
+        thesis = text_right.text_area("投資仮説", value=project.get("investment_thesis", "") if project else "", height=100)
+        catalyst_col, risk_col = responsive_columns(2)
+        catalysts = catalyst_col.text_area("主なカタリスト", value=project.get("catalysts", "") if project else "", height=100)
+        risks = risk_col.text_area("主なリスク", value=project.get("risks", "") if project else "", height=100)
         submitted = st.form_submit_button("保存", type="primary")
     if submitted:
         data = {"id": project_id, "project_name": name, "company_name": company, "stock_code": code, "current_price": price,
@@ -948,6 +956,7 @@ def pl_page() -> None:
     stock_code = project.get("stock_code") or "コード未設定"
     st.caption(f"{company_label}（{stock_code}）｜ 金額：百万円 ｜ 平均株式数：百万株 ｜ 比率：％ ｜ EPS：円")
     stored_entries = get_pl_entries(project_id)
+    financial_document_import_panel(project, "pl")
 
     year_state_key = f"pl_years_state_{project_id}"
     if year_state_key not in st.session_state:
@@ -969,12 +978,6 @@ def pl_page() -> None:
     )
 
     if mode == "数値を編集":
-        with st.expander(
-            "決算資料からPL・セグメントを更新",
-            expanded=not bool(stored_entries) or bool(st.session_state.get(f"auto_financial_fetch_{project_id}")),
-            icon=":material/document_search:",
-        ):
-            financial_document_import_panel(project, "pl")
         with st.expander("年度と区分を編集", icon=":material/view_column:"):
             st.caption("列を追加し、実績・会社予想・自分予想の区分を設定します。")
             add_year, add_type, add_action = responsive_columns([2, 2, 1], vertical_alignment="bottom")
@@ -1364,8 +1367,7 @@ def segment_page() -> None:
     mobile = is_mobile_view()
     st.caption("金額単位：百万円。セグメントごとの売上高と利益を、1つの表で編集します。")
     project = get_project(project_id) or {}
-    with st.expander("決算資料からセグメントを更新", icon=":material/document_search:"):
-        financial_document_import_panel(project, "segment")
+    financial_document_import_panel(project, "segment")
     stored_entries = get_segment_entries(project_id)
     year_state_key = f"segment_years_state_{project_id}"
     name_state_key = f"segment_names_state_{project_id}"
@@ -1378,7 +1380,7 @@ def segment_page() -> None:
     metadata = st.session_state[year_state_key]
     segment_names = st.session_state[name_state_key]
 
-    with st.expander("年度・セグメントを設定", expanded=not metadata or not segment_names, icon=":material/table_edit:"):
+    with st.expander("手入力の行・列を設定", expanded=False, icon=":material/table_edit:"):
         year_col, type_col, year_action = responsive_columns([2, 2, 1], vertical_alignment="bottom")
         new_year = year_col.text_input("年度", placeholder="例：2026.3", key=f"segment_new_year_{project_id}")
         new_type = type_col.selectbox("区分", RESULT_TYPES, key=f"segment_new_type_{project_id}")
