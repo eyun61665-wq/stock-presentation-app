@@ -8,7 +8,7 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = BASE_DIR / "stock_projects.db"
-SCHEMA_VERSION = "8"
+SCHEMA_VERSION = "9"
 API_PROJECT_COLUMNS = {
     "company_name_en": "TEXT DEFAULT ''", "market": "TEXT DEFAULT ''", "sector17": "TEXT DEFAULT ''",
     "sector33": "TEXT DEFAULT ''", "price_date": "TEXT DEFAULT ''", "data_retrieved_at": "TEXT DEFAULT ''",
@@ -59,6 +59,7 @@ def initialize_database(db_path: str | Path = DEFAULT_DB_PATH) -> None:
     needs_api_columns = False
     needs_table_columns = False
     needs_forecast_schema = False
+    needs_segment_metrics_table = False
     if path.exists():
         with get_connection(path) as conn:
             legacy = _table_exists(conn, "projects") and not _table_exists(conn, "app_metadata")
@@ -77,7 +78,8 @@ def initialize_database(db_path: str | Path = DEFAULT_DB_PATH) -> None:
                 if _table_exists(conn, table):
                     existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
                     needs_table_columns = needs_table_columns or bool(set(columns) - existing)
-        if legacy or needs_api_columns or needs_table_columns or needs_forecast_schema:
+            needs_segment_metrics_table = not _table_exists(conn, "segment_metrics")
+        if legacy or needs_api_columns or needs_table_columns or needs_forecast_schema or needs_segment_metrics_table:
             _backup_database(path)
 
     with get_connection(path) as conn:
@@ -132,6 +134,14 @@ def initialize_database(db_path: str | Path = DEFAULT_DB_PATH) -> None:
                 sales REAL, operating_profit REAL, source TEXT DEFAULT '手入力', note TEXT DEFAULT '',
                 FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
                 UNIQUE(project_id, fiscal_year, result_type, segment_name)
+            );
+            CREATE TABLE IF NOT EXISTS segment_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL,
+                fiscal_year TEXT NOT NULL, result_type TEXT DEFAULT '実績',
+                row_label TEXT NOT NULL, value REAL, unit TEXT DEFAULT '',
+                display_order INTEGER DEFAULT 0, source TEXT DEFAULT '手入力', note TEXT DEFAULT '',
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                UNIQUE(project_id, fiscal_year, result_type, row_label)
             );
         """)
         if legacy:
@@ -345,3 +355,32 @@ def save_segment_entries(project_id: int, entries: list[dict], db_path: str | Pa
                                                   row.get("source", row.get("出典")) or "手入力",
                                                   row.get("note", row.get("メモ")) or "")
                                                 for row in entries])
+
+
+def get_segment_metrics(project_id: int, db_path: str | Path = DEFAULT_DB_PATH) -> list[dict]:
+    with get_connection(db_path) as conn:
+        return [dict(row) for row in conn.execute("""
+            SELECT * FROM segment_metrics WHERE project_id=?
+            ORDER BY display_order, row_label, fiscal_year,
+                CASE result_type WHEN '実績' THEN 0 WHEN '会社予想' THEN 1 ELSE 2 END
+        """, (project_id,))]
+
+
+def save_segment_metrics(project_id: int, entries: list[dict], db_path: str | Path = DEFAULT_DB_PATH) -> None:
+    """契約社数や平均単価など、任意のセグメントKPIを年度別に保存する。"""
+    with get_connection(db_path) as conn:
+        conn.execute("DELETE FROM segment_metrics WHERE project_id=?", (project_id,))
+        conn.executemany("""INSERT INTO segment_metrics
+            (project_id, fiscal_year, result_type, row_label, value, unit,
+             display_order, source, note)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""", [(
+                project_id,
+                row.get("fiscal_year", row.get("年度")),
+                row.get("result_type", row.get("区分", "実績")),
+                row.get("row_label", row.get("項目")),
+                row.get("value", row.get("値")),
+                row.get("unit", row.get("単位", "")),
+                int(row.get("display_order", row.get("表示順", 0)) or 0),
+                row.get("source", row.get("出典")) or "手入力",
+                row.get("note", row.get("メモ")) or "",
+            ) for row in entries])

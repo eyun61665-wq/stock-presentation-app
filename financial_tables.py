@@ -329,6 +329,142 @@ def segment_totals_frame(records: list[dict], metadata: list[dict]) -> pd.DataFr
     return pd.DataFrame(rows)
 
 
+def _metric_value(value: Any, unit: str) -> str:
+    number = clean_number(value)
+    if number is None:
+        return ""
+    if unit == "%":
+        return f"{number:,.1f}%"
+    if unit in ("円", "倍"):
+        return f"{number:,.2f}"
+    return f"{number:,.0f}"
+
+
+def segment_analysis_frame(
+    records: list[dict],
+    metadata: list[dict],
+    metrics: list[dict] | None = None,
+) -> pd.DataFrame:
+    """年度を横、セグメントとKPIを縦にした完成表を返す。"""
+    metrics = metrics or []
+    names = segment_names_from_entries(records)
+    lookup = {
+        (
+            str(row.get("fiscal_year")), normalize_result_type(row.get("result_type")),
+            str(row.get("segment_name")),
+        ): row
+        for row in records
+    }
+    metric_lookup = {
+        (
+            str(row.get("fiscal_year")), normalize_result_type(row.get("result_type")),
+            str(row.get("row_label")),
+        ): row
+        for row in metrics
+    }
+    metric_labels = list(dict.fromkeys(
+        str(row.get("row_label", "")).strip()
+        for row in sorted(metrics, key=lambda item: (int(item.get("display_order", 0) or 0), str(item.get("row_label", ""))))
+        if str(row.get("row_label", "")).strip()
+    ))
+
+    rows: list[dict[str, Any]] = []
+    total_sales = {"科目": "売上高（百万円）"}
+    for meta in metadata:
+        values = [
+            clean_number(lookup.get((meta["fiscal_year"], meta["result_type"], name), {}).get("sales"))
+            for name in names
+        ]
+        total = sum(value for value in values if value is not None) if any(value is not None for value in values) else None
+        total_sales[column_title(meta["fiscal_year"], meta["result_type"])] = _format_value(total, "amount")
+    rows.append(total_sales)
+
+    for index, name in enumerate(names, start=1):
+        row = {"科目": f"{index}：{name}"}
+        for meta in metadata:
+            value = lookup.get((meta["fiscal_year"], meta["result_type"], name), {}).get("sales")
+            row[column_title(meta["fiscal_year"], meta["result_type"])] = _format_value(value, "amount")
+        rows.append(row)
+
+    for label in metric_labels:
+        unit = next((str(row.get("unit") or "") for row in metrics if str(row.get("row_label")) == label), "")
+        row = {"科目": label + (f"（{unit}）" if unit else "")}
+        for meta in metadata:
+            item = metric_lookup.get((meta["fiscal_year"], meta["result_type"], label), {})
+            row[column_title(meta["fiscal_year"], meta["result_type"])] = _metric_value(item.get("value"), unit)
+        rows.append(row)
+
+    if any(clean_number(row.get("operating_profit")) is not None for row in records):
+        total_profit = {"科目": "セグメント利益（百万円）"}
+        for meta in metadata:
+            values = [
+                clean_number(lookup.get((meta["fiscal_year"], meta["result_type"], name), {}).get("operating_profit"))
+                for name in names
+            ]
+            total = sum(value for value in values if value is not None) if any(value is not None for value in values) else None
+            total_profit[column_title(meta["fiscal_year"], meta["result_type"])] = _format_value(total, "amount")
+        rows.append(total_profit)
+        for index, name in enumerate(names, start=1):
+            row = {"科目": f"{index}：{name} 利益"}
+            for meta in metadata:
+                value = lookup.get((meta["fiscal_year"], meta["result_type"], name), {}).get("operating_profit")
+                row[column_title(meta["fiscal_year"], meta["result_type"])] = _format_value(value, "amount")
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def segment_metrics_input_frame(metrics: list[dict], metadata: list[dict]) -> pd.DataFrame:
+    """任意KPIを年度横並びで編集するための表を返す。"""
+    labels = list(dict.fromkeys(
+        str(row.get("row_label", "")).strip() for row in metrics
+        if str(row.get("row_label", "")).strip()
+    ))
+    lookup = {
+        (
+            str(row.get("fiscal_year")), normalize_result_type(row.get("result_type")),
+            str(row.get("row_label")),
+        ): row
+        for row in metrics
+    }
+    rows = []
+    for label in labels:
+        sample = next((row for row in metrics if str(row.get("row_label")) == label), {})
+        output = {"KPI": label, "単位": sample.get("unit", "")}
+        for meta in metadata:
+            output[column_title(meta["fiscal_year"], meta["result_type"])] = lookup.get(
+                (meta["fiscal_year"], meta["result_type"], label), {}
+            ).get("value")
+        rows.append(output)
+    return pd.DataFrame(rows)
+
+
+def segment_metrics_from_frame(
+    frame: pd.DataFrame,
+    metadata: list[dict],
+    source: str = "手入力",
+) -> list[dict]:
+    records = []
+    for order, row in enumerate(frame.where(pd.notnull(frame), None).to_dict("records")):
+        label = str(row.get("KPI") or "").strip()
+        if not label:
+            continue
+        for meta in metadata:
+            value = clean_number(row.get(column_title(meta["fiscal_year"], meta["result_type"])))
+            if value is None:
+                continue
+            records.append({
+                "fiscal_year": meta["fiscal_year"],
+                "result_type": meta["result_type"],
+                "row_label": label,
+                "value": value,
+                "unit": str(row.get("単位") or ""),
+                "display_order": order,
+                "source": source,
+                "note": "",
+            })
+    return records
+
+
 def color_columns(frame: pd.DataFrame, metadata: list[dict]) -> pd.io.formats.style.Styler:
     """実績・会社予想・自分予想をモデル表らしく色分けする。"""
     colors = {"実績": "#f8dede", "会社予想": "#fff1c2", "自分予想": "#dcecf8"}

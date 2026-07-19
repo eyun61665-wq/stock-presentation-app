@@ -13,6 +13,9 @@ from financial_tables import (
     segment_totals_frame,
     segment_input_frame,
     segment_records_from_frames,
+    segment_analysis_frame,
+    segment_metrics_input_frame,
+    segment_metrics_from_frame,
 )
 
 
@@ -94,3 +97,41 @@ def test_segment_combined_editor_roundtrip_and_totals():
     totals = segment_totals_frame(records, metadata)
     assert totals.loc[0, "2025.3｜実績"] == "100"
     assert totals.loc[1, "2025.3｜実績"] == "10"
+
+
+def test_segment_complete_table_has_years_across_and_kpis_down():
+    entries = [
+        {"fiscal_year": "2024.3", "result_type": "実績", "segment_name": "主力事業", "sales": 5000},
+        {"fiscal_year": "2025.3", "result_type": "実績", "segment_name": "主力事業", "sales": 6000},
+        {"fiscal_year": "2024.3", "result_type": "実績", "segment_name": "人材事業", "sales": 1000},
+        {"fiscal_year": "2025.3", "result_type": "実績", "segment_name": "人材事業", "sales": 1500},
+    ]
+    metrics = [
+        {"fiscal_year": "2024.3", "result_type": "実績", "row_label": "契約会社数", "value": 1346, "unit": "社", "display_order": 1},
+        {"fiscal_year": "2025.3", "result_type": "実績", "row_label": "契約会社数", "value": 1443, "unit": "社", "display_order": 1},
+    ]
+    metadata = [
+        {"fiscal_year": "2024.3", "result_type": "実績"},
+        {"fiscal_year": "2025.3", "result_type": "実績"},
+    ]
+
+    frame = segment_analysis_frame(entries, metadata, metrics)
+
+    assert list(frame.columns) == ["科目", "2024.3｜実績", "2025.3｜実績"]
+    assert frame.iloc[0].to_dict() == {
+        "科目": "売上高（百万円）", "2024.3｜実績": "6,000", "2025.3｜実績": "7,500"
+    }
+    assert "契約会社数（社）" in frame["科目"].tolist()
+
+
+def test_segment_kpi_editor_roundtrip():
+    metadata = [{"fiscal_year": "2025.3", "result_type": "実績"}]
+    metrics = [{
+        "fiscal_year": "2025.3", "result_type": "実績", "row_label": "平均単価",
+        "value": 4284, "unit": "千円", "display_order": 0,
+    }]
+    frame = segment_metrics_input_frame(metrics, metadata)
+    records = segment_metrics_from_frame(frame, metadata)
+    assert records[0]["row_label"] == "平均単価"
+    assert records[0]["value"] == 4284
+    assert records[0]["unit"] == "千円"

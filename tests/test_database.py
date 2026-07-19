@@ -1,5 +1,6 @@
 from database import (delete_project, get_catalyst, get_pl_entries, get_project, get_scenarios, get_segment_entries,
-                      initialize_database, save_catalyst, save_pl_entries, save_project, save_scenarios, save_segment_entries)
+                      get_segment_metrics, initialize_database, save_catalyst, save_pl_entries, save_project,
+                      save_scenarios, save_segment_entries, save_segment_metrics)
 import sqlite3
 
 
@@ -49,6 +50,23 @@ def test_segment_entries_save_and_reload(tmp_path):
     loaded = get_segment_entries(project_id, db_path)
     assert loaded[0]["segment_name"] == "光学ユニット"
     assert loaded[0]["sales"] == 1200
+
+
+def test_segment_kpis_are_saved_and_reloaded(tmp_path):
+    db_path = tmp_path / "segment_metrics.db"
+    initialize_database(db_path)
+    project_id = save_project({"project_name": "セグメントKPI"}, db_path)
+    save_segment_metrics(project_id, [{
+        "fiscal_year": "2025.3", "result_type": "実績", "row_label": "契約会社数",
+        "value": 1443, "unit": "社", "display_order": 1,
+        "source": "AI解析：決算短信 p.9", "note": "https://example.com/a.pdf",
+    }], db_path)
+
+    loaded = get_segment_metrics(project_id, db_path)
+
+    assert loaded[0]["row_label"] == "契約会社数"
+    assert loaded[0]["value"] == 1443
+    assert loaded[0]["unit"] == "社"
 
 
 def test_expanded_pl_and_segment_result_type_are_saved(tmp_path):

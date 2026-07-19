@@ -7,6 +7,7 @@ from typing import Any
 from data_sources import DataSourceError, download_pdf, fetch_ir_documents
 from financial_parser import parse_detailed_pl, parse_segment_statements
 from pdf_financial_extractor import extract_pdf_pages
+from ai_financial_parser import AIFinancialParserError, OpenAIFinancialParser
 
 
 EXCLUDED_ANNUAL_TITLE_WORDS = (
@@ -117,6 +118,66 @@ def load_official_financials(
     }
 
 
+def load_official_financials_with_ai(
+    ir_url: str,
+    api_key: str,
+    model: str,
+    max_years: int = 5,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    """通常解析で不足した公開PDFをOpenAIへ送り、検証可能な候補を返す。"""
+    documents = select_annual_documents(
+        fetch_ir_documents(ir_url, refresh=refresh),
+        max_documents=max_years + 2,
+    )
+    if not documents:
+        return {
+            "pl_records": [], "segment_records": [], "segment_metrics": [],
+            "documents": [], "warnings": ["AI解析対象の本決算資料を見つけられませんでした。"],
+        }
+    parser = OpenAIFinancialParser(api_key, model=model)
+    pl_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    segments_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+    metrics_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+    used_documents: list[dict[str, str]] = []
+    warnings: list[str] = []
+    for document in documents:
+        try:
+            content, _metadata = download_pdf(document["url"], refresh=refresh)
+            parsed = parser.parse_pdf(content, document["title"], document["url"])
+        except (DataSourceError, OSError, ValueError, AIFinancialParserError) as exc:
+            warnings.append(f"「{document['title']}」のAI解析を完了できませんでした：{exc}")
+            continue
+        if parsed["pl_records"] or parsed["segment_records"] or parsed["segment_metrics"]:
+            used_documents.append(document)
+        warnings.extend(parsed.get("warnings", []))
+        for row in parsed["pl_records"]:
+            key = (str(row["fiscal_year"]), str(row.get("result_type", "実績")))
+            pl_by_key.setdefault(key, row)
+        for row in parsed["segment_records"]:
+            key = (
+                str(row["fiscal_year"]), str(row.get("result_type", "実績")),
+                str(row["segment_name"]),
+            )
+            segments_by_key.setdefault(key, row)
+        for row in parsed["segment_metrics"]:
+            key = (
+                str(row["fiscal_year"]), str(row.get("result_type", "実績")),
+                str(row["row_label"]),
+            )
+            metrics_by_key.setdefault(key, row)
+        actual_years = {key[0] for key in pl_by_key if key[1] == "実績"}
+        if len(actual_years) >= max_years:
+            break
+    return {
+        "pl_records": [pl_by_key[key] for key in sorted(pl_by_key)],
+        "segment_records": [segments_by_key[key] for key in sorted(segments_by_key)],
+        "segment_metrics": [metrics_by_key[key] for key in sorted(metrics_by_key)],
+        "documents": used_documents,
+        "warnings": warnings,
+    }
+
+
 def merge_imported_pl(existing: list[dict], imported: list[dict]) -> list[dict]:
     """取得した実績値を統合し、空欄で手入力値を消さない。"""
     by_key = {(str(row["fiscal_year"]), str(row.get("result_type", "実績"))): dict(row) for row in existing}
@@ -132,6 +193,16 @@ def merge_imported_pl(existing: list[dict], imported: list[dict]) -> list[dict]:
 
 def merge_imported_segments(existing: list[dict], imported: list[dict]) -> list[dict]:
     """取得した実績年度だけを入れ替え、手入力した予想セグメントを残す。"""
+    imported_years = {str(row["fiscal_year"]) for row in imported}
+    kept = [
+        dict(row) for row in existing
+        if str(row.get("result_type", "実績")) != "実績" or str(row["fiscal_year"]) not in imported_years
+    ]
+    return [*kept, *[dict(row) for row in imported]]
+
+
+def merge_imported_segment_metrics(existing: list[dict], imported: list[dict]) -> list[dict]:
+    """取得した実績年度のKPIだけを更新し、手入力した予想KPIを残す。"""
     imported_years = {str(row["fiscal_year"]) for row in imported}
     kept = [
         dict(row) for row in existing

@@ -11,7 +11,8 @@ from calculations import (catalyst_additional_sales, catalyst_sales_from_rate, e
                           operating_margin, sales_growth_rate, scenario_calculation)
 from catalyst_suggestion_service import suggest_catalysts
 from database import (delete_project, get_catalyst, get_pl_entries, get_project, get_scenarios,
-                      get_segment_entries, initialize_database, list_projects, save_catalyst, save_pl_entries, save_segment_entries,
+                      get_segment_entries, get_segment_metrics, initialize_database, list_projects,
+                      save_catalyst, save_pl_entries, save_segment_entries, save_segment_metrics,
                       save_project, save_scenarios)
 from validators import (EVIDENCE_CATEGORIES, catalyst_warnings, complete_pl_records,
                         frame_to_records, pl_warnings, validate_pl_entries, validate_project)
@@ -26,8 +27,11 @@ from pdf_financial_extractor import extract_pdf_preview
 from pdf_financial_extractor import extract_pdf_pages
 from data_sources import DataSourceError, download_pdf, fetch_ir_pdf_links
 from financial_parser import PL_ITEMS, parse_pl_text
-from financial_document_service import (load_official_financials, merge_imported_pl,
-                                          merge_imported_segments, parse_financial_document)
+from financial_document_service import (load_official_financials, load_official_financials_with_ai,
+                                          merge_imported_pl, merge_imported_segments,
+                                          merge_imported_segment_metrics,
+                                          parse_financial_document)
+from ai_financial_parser import AIFinancialParserError, OpenAIFinancialParser
 from ir_source_discovery import (IRSourceDiscoveryError, VERIFIED_IR_SOURCES,
                                  discover_ir_source)
 from exporter import pl_to_csv, pl_to_excel
@@ -40,7 +44,8 @@ from financial_tables import (RESULT_TYPES, color_columns, metadata_from_entries
                               segment_records_from_combined_frame, segment_totals_frame,
                               segment_display_frame,
                               segment_input_frame, segment_names_from_entries,
-                              segment_records_from_frames)
+                              segment_records_from_frames, segment_analysis_frame,
+                              segment_metrics_input_frame, segment_metrics_from_frame)
 from forecast_service import apply_catalyst_to_self_forecast, catalyst_base
 from ui_layout import (DISPLAY_AUTO, DISPLAY_DESKTOP, DISPLAY_MOBILE,
                        DISPLAY_OPTIONS, resolve_display_mode,
@@ -183,6 +188,27 @@ def get_jquants_api_key() -> str | None:
         return None
 
 
+def get_openai_api_key() -> str | None:
+    """AIキーは環境変数またはStreamlit Secretsからだけ読み込む。"""
+    key = os.getenv("OPENAI_API_KEY")
+    if key:
+        return key
+    try:
+        return st.secrets.get("OPENAI_API_KEY")
+    except Exception:
+        return None
+
+
+def get_openai_financial_model() -> str:
+    model = os.getenv("OPENAI_FINANCIAL_MODEL")
+    if model:
+        return model
+    try:
+        return str(st.secrets.get("OPENAI_FINANCIAL_MODEL", "gpt-5.6-luna"))
+    except Exception:
+        return "gpt-5.6-luna"
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def cached_company_search(api_key: str, query: str, refresh_nonce: int) -> list[dict]:
     return find_companies(JQuantsClient(api_key), query)
@@ -196,6 +222,25 @@ def cached_company_data(api_key: str, master: dict, refresh_nonce: int) -> dict:
 @st.cache_data(ttl="6h", max_entries=20, show_spinner=False)
 def cached_official_financials(ir_url: str, max_years: int, refresh_nonce: int) -> dict:
     return load_official_financials(ir_url, max_years=max_years, refresh=bool(refresh_nonce))
+
+
+@st.cache_data(ttl="24h", max_entries=20, show_spinner=False)
+def cached_ai_official_financials(
+    ir_url: str,
+    model: str,
+    max_years: int,
+    refresh_nonce: int,
+) -> dict:
+    api_key = get_openai_api_key()
+    if not api_key:
+        raise AIFinancialParserError("OPENAI_API_KEYが設定されていません。")
+    return load_official_financials_with_ai(
+        ir_url,
+        api_key,
+        model,
+        max_years=max_years,
+        refresh=bool(refresh_nonce),
+    )
 
 
 @st.cache_data(ttl="24h", max_entries=100, show_spinner=False)
@@ -256,11 +301,43 @@ def merge_financial_previews(primary: dict, supplement: dict) -> dict:
                 current[field] = value
         by_key[key] = current
     merged["pl_records"] = [by_key[key] for key in sorted(by_key)]
-    merged["documents"] = [*primary.get("documents", []), *supplement.get("documents", [])]
-    merged["warnings"] = [
-        *primary.get("warnings", []),
-        "公式資料で空欄だったPL項目と会社予想は、J-Quantsの構造化データで補完しました。",
-    ]
+    segment_by_key = {
+        (
+            str(row.get("fiscal_year")), str(row.get("result_type", "実績")),
+            str(row.get("segment_name")),
+        ): dict(row)
+        for row in primary.get("segment_records", [])
+    }
+    for row in supplement.get("segment_records", []):
+        key = (
+            str(row.get("fiscal_year")), str(row.get("result_type", "実績")),
+            str(row.get("segment_name")),
+        )
+        current = segment_by_key.get(key, {})
+        for field, value in row.items():
+            if current.get(field) in (None, "") and value not in (None, ""):
+                current[field] = value
+        segment_by_key[key] = current
+    merged["segment_records"] = [segment_by_key[key] for key in sorted(segment_by_key)]
+
+    metric_by_key = {
+        (
+            str(row.get("fiscal_year")), str(row.get("result_type", "実績")),
+            str(row.get("row_label")),
+        ): dict(row)
+        for row in primary.get("segment_metrics", [])
+    }
+    for row in supplement.get("segment_metrics", []):
+        key = (
+            str(row.get("fiscal_year")), str(row.get("result_type", "実績")),
+            str(row.get("row_label")),
+        )
+        metric_by_key.setdefault(key, dict(row))
+    merged["segment_metrics"] = [metric_by_key[key] for key in sorted(metric_by_key)]
+
+    documents = [*primary.get("documents", []), *supplement.get("documents", [])]
+    merged["documents"] = list({(row.get("title"), row.get("url")): row for row in documents}.values())
+    merged["warnings"] = [*primary.get("warnings", []), *supplement.get("warnings", [])]
     return merged
 
 
@@ -732,6 +809,32 @@ def _uploaded_financial_result(files: list) -> dict:
     }
 
 
+def _financial_result_needs_ai(result: dict, location: str) -> bool:
+    """通常解析で対象画面の主要項目が不足しているか判定する。"""
+    if location == "segment":
+        return not result.get("segment_records")
+    actual = [row for row in result.get("pl_records", []) if row.get("result_type", "実績") == "実績"]
+    if not actual:
+        return True
+    detail_fields = (
+        "sales", "cost_of_sales", "gross_profit", "sga_expenses", "operating_profit",
+        "ordinary_profit", "pretax_profit", "net_income",
+    )
+    return any(any(row.get(field) is None for field in detail_fields) for row in actual)
+
+
+def _uploaded_ai_result(files: list, model: str) -> dict:
+    api_key = get_openai_api_key()
+    if not api_key:
+        raise AIFinancialParserError("OPENAI_API_KEYが設定されていません。")
+    parser = OpenAIFinancialParser(api_key, model=model)
+    result = {"pl_records": [], "segment_records": [], "segment_metrics": [], "warnings": [], "documents": []}
+    for uploaded in files[:5]:
+        parsed = parser.parse_pdf(uploaded.getvalue(), uploaded.name, "アップロード")
+        result = merge_financial_previews(result, parsed)
+    return result
+
+
 def _apply_financial_result(project_id: int, result: dict, location: str) -> int:
     """取得結果のうち、開いている画面の表だけをSQLiteへ反映する。"""
     if location == "pl":
@@ -745,19 +848,28 @@ def _apply_financial_result(project_id: int, result: dict, location: str) -> int
         return len(records)
 
     records = result.get("segment_records", [])
-    if not records:
+    metrics = result.get("segment_metrics", [])
+    if not records and not metrics:
         return 0
-    save_segment_entries(
-        project_id,
-        merge_imported_segments(get_segment_entries(project_id), records),
-    )
+    if records:
+        save_segment_entries(
+            project_id,
+            merge_imported_segments(get_segment_entries(project_id), records),
+        )
+    if metrics:
+        save_segment_metrics(
+            project_id,
+            merge_imported_segment_metrics(get_segment_metrics(project_id), metrics),
+        )
     st.session_state.pop(f"segment_years_state_{project_id}", None)
     st.session_state.pop(f"segment_names_state_{project_id}", None)
+    st.session_state.pop(f"segment_metrics_editor_{project_id}", None)
     clear_state_prefix(f"segment_sales_simple_{project_id}")
     clear_state_prefix(f"segment_profit_simple_{project_id}")
     clear_state_prefix(f"segment_combined_simple_{project_id}")
     clear_state_prefix(f"segment_combined_mobile_{project_id}")
-    return len(records)
+    st.session_state[f"segment_return_to_display_{project_id}"] = True
+    return len(records) + len(metrics)
 
 
 def financial_document_import_panel(project: dict, location: str) -> None:
@@ -785,6 +897,11 @@ def financial_document_import_panel(project: dict, location: str) -> None:
         if source_url:
             source_method = (source_info or {}).get("method", "保存済み公式IR")
             heading.caption(f"取得先：{company_name or stock_code} 公式IR（{source_method}）")
+        ai_enabled = bool(get_openai_api_key())
+        heading.caption(
+            "AI補助：有効（通常解析で不足した項目だけ解析）"
+            if ai_enabled else "AI補助：未設定（OPENAI_API_KEYを設定すると利用できます）"
+        )
         with heading.popover("その他", icon=":material/settings:"):
             refresh_source = st.checkbox(
                 "取得先とキャッシュを更新する",
@@ -827,6 +944,17 @@ def financial_document_import_panel(project: dict, location: str) -> None:
                             result,
                             jquants_financial_fallback(stock_code, nonce),
                         )
+                    if ai_enabled and _financial_result_needs_ai(result, location):
+                        try:
+                            ai_result = cached_ai_official_financials(
+                                source_info["url"], get_openai_financial_model(), 5, nonce,
+                            )
+                            result = merge_financial_previews(result, ai_result)
+                            result.setdefault("warnings", []).append(
+                                "通常解析で不足した項目をAIで補助抽出しました。出典ページを確認してください。"
+                            )
+                        except AIFinancialParserError as ai_exc:
+                            result.setdefault("warnings", []).append(str(ai_exc))
                     st.session_state[preview_key] = result
                 save_project({"id": project_id, "ir_url": source_info["url"]})
                 count = _apply_financial_result(project_id, result, location)
@@ -857,6 +985,17 @@ def financial_document_import_panel(project: dict, location: str) -> None:
         if uploaded and upload_signature != st.session_state.get(upload_signature_key):
             with st.spinner("アップロードしたPDFを解析しています…"):
                 result = _uploaded_financial_result(uploaded)
+                if ai_enabled and _financial_result_needs_ai(result, location):
+                    try:
+                        result = merge_financial_previews(
+                            result,
+                            _uploaded_ai_result(uploaded, get_openai_financial_model()),
+                        )
+                        result.setdefault("warnings", []).append(
+                            "通常解析で不足した項目をAIで補助抽出しました。出典ページを確認してください。"
+                        )
+                    except AIFinancialParserError as ai_exc:
+                        result.setdefault("warnings", []).append(str(ai_exc))
                 st.session_state[preview_key] = result
                 st.session_state[upload_signature_key] = upload_signature
             count = _apply_financial_result(project_id, result, location)
@@ -867,9 +1006,12 @@ def financial_document_import_panel(project: dict, location: str) -> None:
             st.warning(f"PDFから{target_label}を安全に抽出できませんでした。下の表へ手入力できます。")
 
         preview = st.session_state.get(preview_key)
+        if preview:
+            for warning in preview.get("warnings", []):
+                st.caption(f"・{warning}")
         if preview and preview.get("documents"):
             st.caption("出典：" + " ｜ ".join(row["title"] for row in preview["documents"]))
-        st.caption("資料にない項目は空欄のままです。根拠のない数値は推測しません。")
+        st.caption("AIを使う場合も、資料にない項目は空欄のままです。AI抽出値は出典ページと照合してください。")
 
 
 def project_page() -> None:
@@ -1359,28 +1501,76 @@ def catalyst_page() -> None:
 
 
 def segment_page() -> None:
-    """セグメント売上と利益を、1つの横並び表で入力・保存する。"""
+    """セグメント売上・利益・会社固有KPIを年度横並びで表示する。"""
     st.title("セグメント分析")
     project_id = require_project()
     if project_id is None:
         return
     mobile = is_mobile_view()
-    st.caption("金額単位：百万円。セグメントごとの売上高と利益を、1つの表で編集します。")
+    st.caption("年度を横、セグメント売上・利益・会社固有KPIを縦に並べます。金額単位は百万円です。")
     project = get_project(project_id) or {}
     financial_document_import_panel(project, "segment")
     stored_entries = get_segment_entries(project_id)
+    stored_metrics = get_segment_metrics(project_id)
     year_state_key = f"segment_years_state_{project_id}"
     name_state_key = f"segment_names_state_{project_id}"
     if year_state_key not in st.session_state:
         st.session_state[year_state_key] = normalize_metadata(
-            metadata_from_entries(stored_entries or get_pl_entries(project_id))
+            metadata_from_entries([*stored_entries, *stored_metrics] or get_pl_entries(project_id))
         )
     if name_state_key not in st.session_state:
         st.session_state[name_state_key] = segment_names_from_entries(stored_entries)
     metadata = st.session_state[year_state_key]
     segment_names = st.session_state[name_state_key]
 
-    with st.expander("手入力の行・列を設定", expanded=False, icon=":material/table_edit:"):
+    has_segment_data = bool(stored_entries or stored_metrics)
+    mode = "数値を編集"
+    if has_segment_data and metadata:
+        mode_key = f"segment_view_mode_{project_id}"
+        if st.session_state.pop(f"segment_return_to_display_{project_id}", False):
+            st.session_state[mode_key] = "完成表"
+        mode = st.segmented_control(
+            "セグメントの表示モード",
+            ["完成表", "数値を編集"],
+            default="完成表",
+            required=True,
+            key=mode_key,
+            width="stretch",
+        )
+    if mode == "完成表":
+        completed_metadata = metadata
+        completed = segment_analysis_frame(stored_entries, metadata, stored_metrics)
+        if mobile:
+            titles = [column_title(row["fiscal_year"], row["result_type"]) for row in metadata]
+            selected_title = st.selectbox(
+                "表示する年度",
+                titles,
+                index=len(titles) - 1,
+                key=f"segment_mobile_display_year_{project_id}",
+            )
+            completed = completed[["科目", selected_title]]
+            completed_metadata = [
+                row for row in metadata
+                if column_title(row["fiscal_year"], row["result_type"]) == selected_title
+            ]
+        st.subheader("セグメント別業績")
+        st.markdown(":red-badge[実績]  :orange-badge[会社予想]  :blue-badge[自分予想]")
+        st.dataframe(
+            color_columns(completed, completed_metadata),
+            hide_index=True,
+            height=min(760, 36 * (len(completed) + 1)),
+            column_config={"科目": st.column_config.TextColumn("科目", pinned=True, width="large")},
+        )
+        sources = list(dict.fromkeys(
+            str(row.get("source", "")).strip()
+            for row in [*stored_entries, *stored_metrics]
+            if str(row.get("source", "")).strip()
+        ))
+        if sources:
+            st.caption("出典：" + " ｜ ".join(sources[:6]))
+        return
+
+    with st.expander("手入力の行・列を設定", expanded=not metadata or not segment_names, icon=":material/table_edit:"):
         year_col, type_col, year_action = responsive_columns([2, 2, 1], vertical_alignment="bottom")
         new_year = year_col.text_input("年度", placeholder="例：2026.3", key=f"segment_new_year_{project_id}")
         new_type = type_col.selectbox("区分", RESULT_TYPES, key=f"segment_new_type_{project_id}")
@@ -1486,7 +1676,7 @@ def segment_page() -> None:
         title = f"{meta['fiscal_year']}｜{meta['result_type']}"
         number_config[title] = st.column_config.NumberColumn(title, format="%,.0f")
 
-    st.subheader("セグメント別業績")
+    st.subheader("セグメント別業績を編集")
     combined_source = segment_combined_input_frame(stored_entries, metadata, segment_names)
     selected_segment_meta = metadata
     if mobile:
@@ -1545,18 +1735,48 @@ def segment_page() -> None:
         if row["sales"] is not None or row["operating_profit"] is not None
     ]
 
-    st.caption("入力値の合計")
-    st.dataframe(
-        color_columns(segment_totals_frame(records, selected_segment_meta), selected_segment_meta),
-        hide_index=True,
-        column_config={"セグメント": st.column_config.TextColumn("セグメント", pinned=True)},
-    )
-    if st.button("セグメントを保存", type="primary", icon=":material/save:"):
-        if not records:
-            st.error("少なくとも1つの売上高を入力してください。")
+    if records:
+        st.caption("入力値の合計")
+        st.dataframe(
+            color_columns(segment_totals_frame(records, selected_segment_meta), selected_segment_meta),
+            hide_index=True,
+            column_config={"セグメント": st.column_config.TextColumn("セグメント", pinned=True)},
+        )
+
+    with st.expander("契約社数・店舗数・平均単価などのKPIを編集", expanded=bool(stored_metrics)):
+        metric_source = segment_metrics_input_frame(stored_metrics, metadata)
+        if metric_source.empty:
+            metric_source = pd.DataFrame([{
+                "KPI": "", "単位": "",
+                **{column_title(row["fiscal_year"], row["result_type"]): None for row in metadata},
+            }])
+        metric_config = {
+            "KPI": st.column_config.TextColumn("KPI", required=True, pinned=True),
+            "単位": st.column_config.TextColumn("単位"),
+        }
+        metric_config.update({
+            column_title(row["fiscal_year"], row["result_type"]): st.column_config.NumberColumn(format="%,.2f")
+            for row in metadata
+        })
+        edited_metrics = st.data_editor(
+            metric_source,
+            hide_index=True,
+            num_rows="dynamic",
+            column_config=metric_config,
+            key=f"segment_metrics_editor_{project_id}",
+        )
+    metric_source_name = stored_metrics[0]["source"] if stored_metrics else "手入力"
+    metric_records = segment_metrics_from_frame(edited_metrics, metadata, metric_source_name)
+
+    if st.button("セグメント表を保存", type="primary", icon=":material/save:"):
+        if not records and not metric_records:
+            st.error("セグメント売上・利益またはKPIを1つ以上入力してください。")
         else:
             save_segment_entries(project_id, records)
-            st.success("セグメント別業績を保存しました。")
+            save_segment_metrics(project_id, metric_records)
+            st.session_state[f"segment_return_to_display_{project_id}"] = True
+            st.success("セグメント表を保存しました。")
+            st.rerun()
 
 
 def scenario_page() -> None:
