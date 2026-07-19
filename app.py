@@ -780,8 +780,13 @@ def financial_document_import_panel(project: dict, location: str) -> None:
                             )
                         except (DataSourceError, JQuantsApiError, ValueError):
                             pass
-                    if not result.get("pl_records"):
-                        result = jquants_financial_fallback(stock_code, nonce)
+                    if not result.get("pl_records") and get_jquants_api_key():
+                        # 決算説明資料からセグメントだけ取得できた場合でも、
+                        # J-QuantsのPL補完でセグメントを消さない。
+                        result = merge_financial_previews(
+                            result,
+                            jquants_financial_fallback(stock_code, nonce),
+                        )
                     st.session_state[preview_key] = result
                 save_project({"id": project_id, "ir_url": source_info["url"]})
                 st.toast("PL・セグメント候補を取得しました。", icon=":material/check_circle:")
@@ -1077,7 +1082,8 @@ def pl_page() -> None:
         st.dataframe(
             color_columns(completed_frame, completed_metadata),
             hide_index=True,
-            height=min(900, 34 * (len(completed_frame) + 2)),
+            # ヘッダー分だけ余白を確保し、末尾に空欄行を表示しない。
+            height=min(900, 34 * (len(completed_frame) + 1)),
             column_config={"科目": st.column_config.TextColumn("科目", pinned=True)},
         )
 

@@ -86,6 +86,14 @@ def test_select_annual_documents_accepts_year_end_title_without_annual_word():
     assert select_annual_documents(documents) == [documents[0]]
 
 
+def test_select_annual_documents_includes_annual_presentation_for_segments():
+    documents = [
+        {"title": "2026年3月期 決算説明資料", "url": "presentation.pdf"},
+        {"title": "2026年3月期 第3四半期 決算説明資料", "url": "q3.pdf"},
+    ]
+    assert select_annual_documents(documents) == [documents[0]]
+
+
 def test_select_annual_documents_excludes_correction_notice():
     documents = [
         {"title": "（訂正）2026年3月期 決算短信〔日本基準〕（連結）", "url": "correction.pdf"},

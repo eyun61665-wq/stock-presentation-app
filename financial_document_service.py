@@ -14,18 +14,30 @@ EXCLUDED_ANNUAL_TITLE_WORDS = (
     "中間期", "業績予想", "差異", "修正", "訂正", "説明会", "有価証券報告書",
 )
 
+# 決算短信には詳細PL、決算説明資料にはセグメントが載ることが多い。
+# どちらも年次資料として扱い、実際に数値を抽出できた資料だけを反映候補にする。
+ANNUAL_FINANCIAL_TITLE_WORDS = (
+    "決算短信",
+    "決算説明資料",
+    "決算補足資料",
+    "決算概要",
+)
+
 
 def select_annual_documents(documents: list[dict[str, str]], max_documents: int = 6) -> list[dict[str, str]]:
     """IR一覧から本決算短信だけを新しい順のまま抽出する。"""
     selected: list[dict[str, str]] = []
     for document in documents:
         title = " ".join(str(document.get("title", "")).split())
-        if "決算短信" not in title or any(word in title for word in EXCLUDED_ANNUAL_TITLE_WORDS):
+        if (not any(word in title for word in ANNUAL_FINANCIAL_TITLE_WORDS)
+                or any(word in title for word in EXCLUDED_ANNUAL_TITLE_WORDS)):
             continue
-        # 「YYYY年M月期 決算短信」「通期決算短信」「平成...期 決算短信」を許容する。
-        # 「2026年2月期決算短信」のように「通期」という語がない公式IRもある。
+        # 「YYYY年M月期 決算短信・説明資料」「通期決算資料」を許容する。
+        # 「2026年2月期決算説明資料」のように「通期」という語がない公式IRもある。
         # 第1～3四半期・中間期は EXCLUDED_ANNUAL_TITLE_WORDS で除外済み。
-        if "通期" not in title and not re.search(r"(?:20\d{2}年|平成\d+年).{0,8}期.*決算短信", title):
+        if "通期" not in title and not re.search(
+            r"(?:20\d{2}年|平成\d+年).{0,8}期.*決算(?:短信|説明資料|補足資料|概要)", title
+        ):
             continue
         selected.append({"title": title, "url": document["url"]})
         if len(selected) >= max_documents:
