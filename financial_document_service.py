@@ -26,6 +26,12 @@ ANNUAL_FINANCIAL_TITLE_WORDS = (
 )
 
 
+def _period_key(value: Any) -> str:
+    text = str(value or "")
+    match = re.search(r"(20\d{2})[^0-9]+(\d{1,2})", text)
+    return f"{int(match.group(1)):04d}.{int(match.group(2))}" if match else text
+
+
 def select_annual_documents(documents: list[dict[str, str]], max_documents: int = 6) -> list[dict[str, str]]:
     """IR一覧から本決算短信だけを新しい順のまま抽出する。"""
     selected: list[dict[str, str]] = []
@@ -71,17 +77,12 @@ def _merge_free_results(primary: dict[str, Any], supplement: dict[str, Any]) -> 
     """従来解析を優先し、表レイアウト解析で空欄と未取得行を補う。"""
     result = dict(primary)
 
-    def period_key(value: Any) -> str:
-        text = str(value or "")
-        match = re.search(r"(20\d{2})[^0-9]+(\d{1,2})", text)
-        return f"{int(match.group(1)):04d}.{int(match.group(2))}" if match else text
-
     pl_by_key = {
-        (period_key(row.get("fiscal_year")), str(row.get("result_type", "実績"))): dict(row)
+        (_period_key(row.get("fiscal_year")), str(row.get("result_type", "実績"))): dict(row)
         for row in primary.get("pl_records", [])
     }
     for row in supplement.get("pl_records", []):
-        key = (period_key(row.get("fiscal_year")), str(row.get("result_type", "実績")))
+        key = (_period_key(row.get("fiscal_year")), str(row.get("result_type", "実績")))
         current = pl_by_key.get(key, {})
         for field, value in row.items():
             if current.get(field) in (None, "") and value not in (None, ""):
@@ -90,11 +91,11 @@ def _merge_free_results(primary: dict[str, Any], supplement: dict[str, Any]) -> 
     result["pl_records"] = [pl_by_key[key] for key in sorted(pl_by_key)]
 
     segment_by_key = {
-        (period_key(row.get("fiscal_year")), str(row.get("result_type", "実績")), str(row.get("segment_name"))): dict(row)
+        (_period_key(row.get("fiscal_year")), str(row.get("result_type", "実績")), str(row.get("segment_name"))): dict(row)
         for row in primary.get("segment_records", [])
     }
     for row in supplement.get("segment_records", []):
-        key = (period_key(row.get("fiscal_year")), str(row.get("result_type", "実績")), str(row.get("segment_name")))
+        key = (_period_key(row.get("fiscal_year")), str(row.get("result_type", "実績")), str(row.get("segment_name")))
         current = segment_by_key.get(key, {})
         for field, value in row.items():
             if current.get(field) in (None, "") and value not in (None, ""):
@@ -103,11 +104,11 @@ def _merge_free_results(primary: dict[str, Any], supplement: dict[str, Any]) -> 
     result["segment_records"] = [segment_by_key[key] for key in sorted(segment_by_key)]
 
     metric_by_key = {
-        (period_key(row.get("fiscal_year")), str(row.get("result_type", "実績")), str(row.get("row_label"))): dict(row)
+        (_period_key(row.get("fiscal_year")), str(row.get("result_type", "実績")), str(row.get("row_label"))): dict(row)
         for row in primary.get("segment_metrics", [])
     }
     for row in supplement.get("segment_metrics", []):
-        key = (period_key(row.get("fiscal_year")), str(row.get("result_type", "実績")), str(row.get("row_label")))
+        key = (_period_key(row.get("fiscal_year")), str(row.get("result_type", "実績")), str(row.get("row_label")))
         metric_by_key.setdefault(key, dict(row))
     result["segment_metrics"] = [metric_by_key[key] for key in sorted(metric_by_key)]
     return result
@@ -115,15 +116,18 @@ def _merge_free_results(primary: dict[str, Any], supplement: dict[str, Any]) -> 
 
 def load_official_financials(
     ir_url: str,
-    max_years: int = 5,
+    max_years: int = 3,
     refresh: bool = False,
 ) -> dict[str, Any]:
     """公式IR一覧から必要な年数が集まるまで本決算短信を解析する。"""
-    documents = select_annual_documents(fetch_ir_documents(ir_url, refresh=refresh), max_documents=max_years + 2)
+    documents = select_annual_documents(
+        fetch_ir_documents(ir_url, refresh=refresh), max_documents=max_years * 2 + 2
+    )
     if not documents:
         return {"pl_records": [], "segment_records": [], "segment_metrics": [], "documents": [], "warnings": ["本決算短信を見つけられませんでした。"]}
 
     pl_by_year: dict[str, dict[str, Any]] = {}
+    presentation_pl_by_year: dict[str, dict[str, Any]] = {}
     segments_by_key: dict[tuple[str, str], dict[str, Any]] = {}
     metrics_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
     used_documents: list[dict[str, str]] = []
@@ -148,22 +152,57 @@ def load_official_financials(
             used_documents.append(document)
         warnings.extend(parsed["warnings"])
         # IRページは新しい順。後から古い短信を読んでも同年度を上書きしない。
-        for row in parsed["pl_records"]:
-            pl_by_year.setdefault(str(row["fiscal_year"]), row)
+        # 実績PLは決算短信だけを採用する。説明資料にある翌期計画を実績と混同しない。
+        title_month_match = re.search(r"20\d{2}年\s*(\d{1,2})月期", document["title"])
+        title_month = int(title_month_match.group(1)) if title_month_match else None
+        if "決算短信" in document["title"]:
+            for row in parsed["pl_records"]:
+                if str(row.get("result_type", "実績")) == "実績":
+                    period = _period_key(row["fiscal_year"])
+                    period_match = re.search(r"20\d{2}\.(\d{1,2})", period)
+                    if title_month and period_match and int(period_match.group(1)) != title_month:
+                        continue
+                    normalized = dict(row)
+                    normalized["fiscal_year"] = period
+                    pl_by_year.setdefault(period, normalized)
+        else:
+            # 説明資料のPLは、短信で確定した同一年度の空欄補完にだけ利用する。
+            for row in parsed["pl_records"]:
+                if str(row.get("result_type", "実績")) != "実績":
+                    continue
+                period = _period_key(row["fiscal_year"])
+                period_match = re.search(r"20\d{2}\.(\d{1,2})", period)
+                if title_month and period_match and int(period_match.group(1)) != title_month:
+                    continue
+                normalized = dict(row)
+                normalized["fiscal_year"] = period
+                current = presentation_pl_by_year.setdefault(period, {})
+                current.update({key: value for key, value in normalized.items() if value not in (None, "")})
         for row in parsed["segment_records"]:
-            key = (str(row["fiscal_year"]), str(row["segment_name"]))
-            segments_by_key.setdefault(key, row)
+            normalized = dict(row)
+            normalized["fiscal_year"] = _period_key(row["fiscal_year"])
+            key = (normalized["fiscal_year"], str(row["segment_name"]))
+            segments_by_key.setdefault(key, normalized)
         for row in parsed.get("segment_metrics", []):
+            normalized = dict(row)
+            normalized["fiscal_year"] = _period_key(row["fiscal_year"])
             key = (
-                str(row["fiscal_year"]), str(row.get("result_type", "実績")),
+                normalized["fiscal_year"], str(row.get("result_type", "実績")),
                 str(row["row_label"]),
             )
-            metrics_by_key.setdefault(key, row)
+            metrics_by_key.setdefault(key, normalized)
         if len(pl_by_year) >= max_years:
             break
 
     selected_years = sorted(pl_by_year)[-max_years:]
-    pl_records = [pl_by_year[year] for year in selected_years]
+    pl_records: list[dict[str, Any]] = []
+    for year in selected_years:
+        record = dict(pl_by_year[year])
+        supplement = presentation_pl_by_year.get(year, {})
+        for field, value in supplement.items():
+            if record.get(field) in (None, "") and value not in (None, ""):
+                record[field] = value
+        pl_records.append(record)
     segment_records = [
         row for key, row in segments_by_key.items() if key[0] in selected_years
     ]
@@ -184,7 +223,7 @@ def load_official_financials_with_ai(
     ir_url: str,
     api_key: str,
     model: str,
-    max_years: int = 5,
+    max_years: int = 3,
     refresh: bool = False,
 ) -> dict[str, Any]:
     """通常解析で不足した公開PDFをOpenAIへ送り、検証可能な候補を返す。"""
@@ -240,15 +279,29 @@ def load_official_financials_with_ai(
     }
 
 
+def select_recent_pl_records(records: list[dict], max_actual_years: int = 3) -> list[dict]:
+    """実績は直近N期に絞り、会社予想・自分予想は残す。"""
+    actual_years = sorted({
+        str(row.get("fiscal_year", "")) for row in records
+        if str(row.get("result_type", "実績")) == "実績"
+    })[-max_actual_years:]
+    return [
+        dict(row) for row in records
+        if str(row.get("result_type", "実績")) != "実績"
+        or str(row.get("fiscal_year", "")) in actual_years
+    ]
+
+
 def merge_imported_pl(existing: list[dict], imported: list[dict]) -> list[dict]:
     """取得した実績値を統合し、空欄で手入力値を消さない。"""
     by_key = {(str(row["fiscal_year"]), str(row.get("result_type", "実績"))): dict(row) for row in existing}
     for row in imported:
-        key = (str(row["fiscal_year"]), "実績")
+        result_type = str(row.get("result_type", "実績"))
+        key = (str(row["fiscal_year"]), result_type)
         merged = dict(by_key.get(key, {}))
         merged.update({field: value for field, value in row.items() if value not in (None, "")})
         merged["fiscal_year"] = str(row["fiscal_year"])
-        merged["result_type"] = "実績"
+        merged["result_type"] = result_type
         by_key[key] = merged
     return [by_key[key] for key in sorted(by_key)]
 

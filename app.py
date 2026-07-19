@@ -5,11 +5,14 @@ import os
 import time
 
 import pandas as pd
+import requests
 import streamlit as st
 
 from calculations import (catalyst_additional_sales, catalyst_sales_from_rate, eps, market_capitalization,
                           operating_margin, sales_growth_rate, scenario_calculation)
 from catalyst_suggestion_service import suggest_catalysts
+from catalyst_research_service import research_catalyst_context
+from company_profile_service import fetch_company_profile, fill_empty_profile
 from database import (delete_project, get_catalyst, get_pl_entries, get_project, get_scenarios,
                       get_segment_entries, get_segment_metrics, initialize_database, list_projects,
                       save_catalyst, save_pl_entries, save_segment_entries, save_segment_metrics,
@@ -33,7 +36,7 @@ from financial_parser import PL_ITEMS, parse_pl_text
 from financial_document_service import (load_official_financials, load_official_financials_with_ai,
                                           merge_imported_pl, merge_imported_segments,
                                           merge_imported_segment_metrics,
-                                          parse_financial_document)
+                                          parse_financial_document, select_recent_pl_records)
 from ai_financial_parser import AIFinancialParserError, OpenAIFinancialParser
 from ir_source_discovery import (IRSourceDiscoveryError, VERIFIED_IR_SOURCES,
                                  discover_ir_source)
@@ -292,6 +295,51 @@ def cached_ir_source(
     if saved_url and not refresh_nonce:
         return {"url": saved_url, "method": "保存済み公式IR"}
     return discover_ir_source(stock_code, company_name, refresh=bool(refresh_nonce))
+
+
+@st.cache_data(ttl="24h", max_entries=100, show_spinner=False)
+def cached_company_profile(ir_url: str, company_name: str, sector: str) -> dict[str, str]:
+    return fetch_company_profile(ir_url, company_name, sector)
+
+
+@st.cache_data(ttl="6h", max_entries=100, show_spinner=False)
+def cached_catalyst_context(company_name: str, sector: str) -> list[dict[str, str]]:
+    return research_catalyst_context(company_name, sector)
+
+
+def enrich_project_profile(project_id: int, project: dict) -> dict:
+    """企業入力時に公式説明と検討候補を空欄だけへ補う。"""
+    current = get_project(project_id) or dict(project)
+    company_name = str(current.get("company_name") or current.get("project_name") or "").strip()
+    stock_code = str(current.get("stock_code") or "").strip()
+    ir_url = str(current.get("ir_url") or "").strip()
+    if stock_code and company_name and not ir_url:
+        try:
+            source = cached_ir_source(stock_code, company_name, "", 0)
+            ir_url = source["url"]
+        except (IRSourceDiscoveryError, DataSourceError, ValueError, OSError):
+            pass
+    try:
+        candidates = cached_company_profile(
+            ir_url,
+            company_name,
+            str(current.get("sector33") or current.get("sector17") or ""),
+        )
+        # 一時的な通信失敗で空結果がキャッシュされていても、事業内容だけは再確認する。
+        if ir_url and not candidates.get("business_description"):
+            candidates = fetch_company_profile(
+                ir_url,
+                company_name,
+                str(current.get("sector33") or current.get("sector17") or ""),
+            )
+    except (requests.RequestException, ValueError, OSError):
+        candidates = fetch_company_profile(
+            "", company_name, str(current.get("sector33") or current.get("sector17") or "")
+        )
+    updated = fill_empty_profile(current, candidates)
+    updated.update({"id": project_id, "ir_url": ir_url or current.get("ir_url", "")})
+    save_project(updated)
+    return updated
 
 
 def jquants_financial_fallback(stock_code: str, refresh_nonce: int = 0) -> dict:
@@ -724,6 +772,8 @@ def simple_company_data_panel(project: dict | None) -> None:
             if existing:
                 existing_id = int(existing["id"])
                 set_active_project(existing_id)
+                with st.spinner("会社概要と投資の確認ポイントを整えています…"):
+                    enrich_project_profile(existing_id, existing)
                 st.session_state.pop("simple_company_preview", None)
                 st.session_state[f"auto_financial_fetch_{existing_id}"] = True
                 st.session_state.simple_lookup_feedback = (
@@ -762,6 +812,8 @@ def simple_company_data_panel(project: dict | None) -> None:
                     "stock_code": normalized_code,
                     "ir_url": VERIFIED_IR_SOURCES.get(normalized_code, ""),
                 })
+                with st.spinner("会社概要と投資の確認ポイントを整えています…"):
+                    enrich_project_profile(project_id, get_project(project_id) or {})
                 set_active_project(project_id)
                 st.session_state[f"auto_financial_fetch_{project_id}"] = True
                 message = f"{company_name or normalized_code}のプロジェクトを作成しました。この画面のまま会社概要を確認・編集できます。PL・業績予想を選ぶと取得候補を表示します。"
@@ -784,7 +836,7 @@ def simple_company_data_panel(project: dict | None) -> None:
         metrics[1].metric("株式数", "-" if shares.get("net_issued_shares") is None else f"{shares['net_issued_shares']:,.3f}百万株")
         metrics[2].metric("時価総額", "-" if calculated.get("market_cap") is None else f"{calculated['market_cap']:,.1f}億円")
         metrics[3].metric("PER", "-" if calculated.get("current_per") is None else f"{calculated['current_per']:,.1f}倍")
-        pl_records = build_pl_import_records(preview["financials"])
+        pl_records = select_recent_pl_records(build_pl_import_records(preview["financials"]), 3)
         if pl_records:
             st.dataframe(pd.DataFrame(pl_records)[[
                 "fiscal_year", "sales", "operating_profit", "ordinary_profit",
@@ -814,7 +866,9 @@ def simple_company_data_panel(project: dict | None) -> None:
             updated["project_name"] = updated.get("project_name") or master["company_name"]
             project_id = save_project(updated)
             if apply_pl:
-                save_structured_pl(project_id, pl_records)
+                save_structured_pl(project_id, select_recent_pl_records(pl_records, 3))
+            with st.spinner("会社概要と投資の確認ポイントを整えています…"):
+                enrich_project_profile(project_id, get_project(project_id) or updated)
             set_active_project(project_id)
             st.session_state[f"auto_financial_fetch_{project_id}"] = True
             st.success("確認したデータを反映しました。現在の画面は切り替えません。PL・業績予想を選ぶと、PL・セグメントの取得候補を表示します。")
@@ -884,7 +938,7 @@ def _uploaded_ai_result(files: list, model: str) -> dict:
 def _apply_financial_result(project_id: int, result: dict, location: str) -> int:
     """取得結果のうち、開いている画面の表だけをSQLiteへ反映する。"""
     if location == "pl":
-        records = result.get("pl_records", [])
+        records = select_recent_pl_records(result.get("pl_records", []), 3)
         if not records:
             return 0
         save_pl_entries(project_id, merge_imported_pl(get_pl_entries(project_id), records))
@@ -936,8 +990,8 @@ def financial_document_import_panel(project: dict, location: str) -> None:
 
     with st.container(border=True):
         heading, action = responsive_columns([4, 1], vertical_alignment="center")
-        heading.markdown(f"#### 決算短信から{target_label}を自動入力")
-        heading.caption("銘柄コードから公式IRを探し、本決算短信の連結データを表へ直接反映します。")
+        heading.markdown(f"#### 決算資料から{target_label}を自動入力")
+        heading.caption("銘柄コードから公式IRを探し、決算短信と決算説明資料の連結データを表へ直接反映します。")
         source_info = st.session_state.get(source_key)
         source_url = (source_info or {}).get("url") or saved_url
         if source_url:
@@ -986,10 +1040,10 @@ def financial_document_import_panel(project: dict, location: str) -> None:
                 with st.spinner("企業公式IRを探し、最新の本決算短信を取得・解析しています…"):
                     source_info = cached_ir_source(stock_code, company_name, saved_url, nonce)
                     st.session_state[source_key] = source_info
-                    result = cached_official_financials(source_info["url"], 5, nonce)
+                    result = cached_official_financials(source_info["url"], 3, nonce)
                     if get_edinet_api_key():
                         try:
-                            edinet_result = cached_edinet_financials(stock_code, 5, nonce)
+                            edinet_result = cached_edinet_financials(stock_code, 3, nonce)
                             # 標準化されたXBRLを基準にし、短信PDFで詳細行・KPIを補う。
                             result = merge_financial_previews(edinet_result, result)
                         except (EDINETError, EDINETMasterError, ValueError, OSError) as edinet_exc:
@@ -1012,7 +1066,7 @@ def financial_document_import_panel(project: dict, location: str) -> None:
                     if use_paid_ai and _financial_result_needs_ai(result, location):
                         try:
                             ai_result = cached_ai_official_financials(
-                                source_info["url"], get_openai_financial_model(), 5, nonce,
+                                source_info["url"], get_openai_financial_model(), 3, nonce,
                             )
                             result = merge_financial_previews(result, ai_result)
                             result.setdefault("warnings", []).append(
@@ -1036,7 +1090,7 @@ def financial_document_import_panel(project: dict, location: str) -> None:
                     if get_edinet_api_key():
                         with st.spinner("無料のEDINET XBRLへ切り替えています…"):
                             result = cached_edinet_financials(
-                                stock_code, 5, time.time_ns() if refresh_source else 0,
+                                stock_code, 3, time.time_ns() if refresh_source else 0,
                             )
                         count = _apply_financial_result(project_id, result, location)
                         if count:
@@ -1429,10 +1483,13 @@ def catalyst_page() -> None:
     for key, value in widget_defaults.items():
         st.session_state.setdefault(key, value)
 
-    suggestions = suggest_catalysts(project, pl_entries, segment_entries)
+    company_name = str(project.get("company_name") or project.get("project_name") or "")
+    sector = str(project.get("sector33") or project.get("sector17") or "")
+    external_context = cached_catalyst_context(company_name, sector) if company_name else []
+    suggestions = suggest_catalysts(project, pl_entries, segment_entries, external_context)
     with st.container(border=True):
         st.subheader("カタリスト候補")
-        st.caption("保存済みのPL・セグメント・事業内容から検討候補を作ります。外部事実ではなく、売上感応度を見るための仮定です。")
+        st.caption("企業周辺の公開情報、技術進化、法令・制度・業界ルールと、保存済みPL・セグメントから候補を作ります。売上影響率は検討用の仮定です。")
         if not suggestions:
             st.info("実績売上をPLへ保存すると、カタリスト候補と売上影響レンジを表示できます。")
         else:
@@ -1462,6 +1519,14 @@ def catalyst_page() -> None:
                 key=f"catalyst_suggestion_{project_id}",
             )
             st.write(selected["rationale"])
+            if selected.get("source_url"):
+                st.link_button(
+                    f"出典を確認：{selected.get('source_title') or '公開情報'}",
+                    selected["source_url"],
+                    icon=":material/open_in_new:",
+                )
+                if selected.get("published"):
+                    st.caption(f"公開日時：{selected['published']}")
             low, standard, high = metric_slots(3)
             low.metric("弱気の追加売上", f"{selected['low_impact']:,.0f}百万円", f"影響率 {selected['low_rate']:g}％")
             standard.metric("標準の追加売上", f"{selected['standard_impact']:,.0f}百万円", f"影響率 {selected['standard_rate']:g}％")
@@ -1474,8 +1539,12 @@ def catalyst_page() -> None:
                 st.session_state[f"cat_method_{project_id}"] = "売上比率モデル"
                 st.session_state[f"cat_base_sales_{project_id}"] = float(selected["reference_sales"])
                 st.session_state[f"cat_impact_rate_{project_id}"] = float(selected["standard_rate"])
-                st.session_state[f"cat_category_{project_id}"] = "自分の仮定"
-                st.session_state[f"cat_source_{project_id}"] = "保存済みPL・セグメントからの試算"
+                st.session_state[f"cat_category_{project_id}"] = (
+                    "外部レポート" if selected.get("source_url") else "自分の仮定"
+                )
+                st.session_state[f"cat_source_{project_id}"] = (
+                    selected.get("source_url") or "保存済みPL・セグメントからの試算"
+                )
                 st.session_state[f"cat_note_{project_id}"] = selected["assumption"]
                 st.rerun()
 

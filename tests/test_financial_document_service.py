@@ -1,5 +1,6 @@
 from financial_document_service import (load_official_financials, merge_imported_pl,
-                                          merge_imported_segments, select_annual_documents)
+                                          merge_imported_segments, select_annual_documents,
+                                          select_recent_pl_records)
 from financial_parser import parse_detailed_pl, parse_segment_statements
 
 
@@ -172,3 +173,22 @@ def test_imported_blank_does_not_erase_manual_pl_value():
 
     assert merged[0]["sales"] == 110
     assert merged[0]["ordinary_profit"] == 12
+
+
+def test_recent_pl_keeps_three_actual_years_and_forecasts():
+    records = [
+        {"fiscal_year": f"{year}.3", "result_type": "実績", "sales": year}
+        for year in range(2021, 2026)
+    ] + [{"fiscal_year": "2026.3", "result_type": "会社予想", "sales": 300}]
+    selected = select_recent_pl_records(records, 3)
+    assert [(row["fiscal_year"], row["result_type"]) for row in selected] == [
+        ("2023.3", "実績"), ("2024.3", "実績"), ("2025.3", "実績"),
+        ("2026.3", "会社予想"),
+    ]
+
+
+def test_company_forecast_is_not_changed_to_actual_when_imported():
+    merged = merge_imported_pl([], [{
+        "fiscal_year": "2026.3", "result_type": "会社予想", "sales": 300,
+    }])
+    assert merged[0]["result_type"] == "会社予想"

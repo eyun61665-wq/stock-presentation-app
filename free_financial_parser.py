@@ -42,6 +42,10 @@ KPI_HINTS = (
     "契約", "顧客", "店舗", "拠点", "会員", "ユーザー", "利用者", "アカウント",
     "件数", "社数", "単価", "台数", "人員", "従業員", "席数", "室数", "面積",
 )
+KPI_EXCLUDED_WORDS = (
+    "増減額", "売上債権", "契約負債", "その主な", "千円等", "百万円等",
+    "増収効果", "人件費", "前払費用", "投資有価証券", "買掛金",
+)
 SEGMENT_HINTS = ("事業", "セグメント", "部門", "地域", "サービス")
 TOTAL_LABELS = ("合計", "計", "全社", "調整額", "消去", "その他")
 NUMBER_RE = re.compile(r"[△▲▲(（-]?\s*[\d０-９][\d０-９,，]*(?:[.．]\d+)?\s*[)）]?")
@@ -114,6 +118,15 @@ def _is_numeric_cell(value: Any) -> bool:
     return bool(re.fullmatch(r"[△▲(（-]?\s*[\d０-９][\d０-９,，]*(?:[.．]\d+)?\s*[)）]?", text))
 
 
+def _valid_kpi_label(label: str) -> bool:
+    text = _clean(label)
+    if not text or len(text) > 35 or "。" in text:
+        return False
+    if any(word in text for word in KPI_EXCLUDED_WORDS):
+        return False
+    return any(hint in text for hint in KPI_HINTS)
+
+
 def _to_million(value: Any, unit: str, shares: bool = False) -> float | None:
     number = _number(value)
     if number is None:
@@ -163,6 +176,9 @@ def extract_pdf_layout(content: bytes, max_pages: int = 60) -> list[dict[str, An
                 "page": number,
                 "text": text,
                 "tables": [[[_clean(cell) for cell in row] for row in table if row] for table in tables],
+                "words": page.extract_words(x_tolerance=2, y_tolerance=3) or [],
+                "width": float(page.width),
+                "height": float(page.height),
             })
     return pages
 
@@ -285,6 +301,90 @@ def _parse_segment_matrix(
     ]
 
 
+def _business_segment_names(page_text: str) -> list[str]:
+    """事業別グラフの凡例から、重複しない事業名を表示順で返す。"""
+    names: list[str] = []
+    for line in page_text.splitlines():
+        for part in re.split(r"\s{2,}", line.strip()):
+            name = _clean(part)
+            if not name.endswith("事業") or len(name) > 30:
+                continue
+            if any(word in name for word in ("事業別", "事業内容", "主な", "進捗")):
+                continue
+            if name not in names:
+                names.append(name)
+    return names
+
+
+def _chart_year(word: str) -> str | None:
+    text = _clean(word)
+    match = re.fullmatch(r"(\d{2,4})[./年](\d{1,2})月?期", text)
+    if not match:
+        return None
+    year = int(match.group(1))
+    if year < 100:
+        year += 2000
+    return f"{year:04d}.{int(match.group(2))}"
+
+
+def _parse_business_sales_chart(
+    page: dict[str, Any], source_name: str, source_url: str, retrieved_at: str,
+) -> list[dict[str, Any]]:
+    """決算説明資料の積み上げグラフから、明示された事業別売上を抽出する。"""
+    page_text = str(page.get("text", ""))
+    if "事業別売上高" not in page_text or "単位：百万円" not in page_text:
+        return []
+    names = _business_segment_names(page_text)
+    if len(names) < 2:
+        return []
+    width = float(page.get("width") or 0)
+    words = page.get("words") or []
+    if width <= 0 or not words:
+        return []
+    # 左半分が売上高、右半分が売上総利益などの比較グラフを想定する。
+    sales_words = [word for word in words if float(word.get("x0", 0)) < width * 0.52]
+    year_anchors: list[tuple[float, float, str]] = []
+    for word in sales_words:
+        fiscal_year = _chart_year(str(word.get("text", "")))
+        if fiscal_year:
+            year_anchors.append((float(word.get("x0", 0)), float(word.get("top", 0)), fiscal_year))
+    if not year_anchors:
+        return []
+
+    result_type = _result_type(page_text)
+    output: list[dict[str, Any]] = []
+    for x_anchor, top_anchor, fiscal_year in year_anchors:
+        candidates: list[tuple[float, float]] = []
+        for word in sales_words:
+            raw = _clean(word.get("text", ""))
+            if not re.fullmatch(r"\d[\d,]*", raw):
+                continue
+            x0, top = float(word.get("x0", 0)), float(word.get("top", 0))
+            if abs(x0 - x_anchor) > max(34.0, width * 0.045) or top >= top_anchor - 8:
+                continue
+            value = _to_million(raw, "百万円")
+            if value is not None:
+                candidates.append((top, value))
+        # 合計値が最上段、その下に凡例順の構成値が並ぶ積み上げグラフ。
+        candidates = sorted(set(candidates))
+        if len(candidates) < len(names) + 1:
+            continue
+        segment_values = candidates[-len(names):]
+        for name, (_top, value) in zip(names, segment_values):
+            output.append({
+                "fiscal_year": fiscal_year,
+                "result_type": result_type,
+                "segment_name": name,
+                "sales": value,
+                "operating_profit": None,
+                "source": "決算資料PDF（無料解析）",
+                "basis_date": "",
+                "note": f"{source_name} p.{page.get('page', 0)} {source_url}",
+                "retrieved_at": retrieved_at,
+            })
+    return output
+
+
 def parse_layout_tables(
     layouts: list[dict[str, Any]], source_name: str, source_url: str, retrieved_at: str,
 ) -> dict[str, list[dict[str, Any]]]:
@@ -297,6 +397,9 @@ def parse_layout_tables(
         page_number = int(page.get("page", 0))
         page_text = str(page.get("text", ""))
         unit = detect_unit(page_text)
+        for item in _parse_business_sales_chart(page, source_name, source_url, retrieved_at):
+            key = (item["fiscal_year"], item["result_type"], item["segment_name"])
+            segments.setdefault(key, item)
         for table in page.get("tables", []):
             if not table or max((len(row) for row in table), default=0) < 2:
                 continue
@@ -386,7 +489,7 @@ def parse_layout_tables(
                         })
                     continue
 
-                if any(hint in clean_label for hint in KPI_HINTS) and (
+                if _valid_kpi_label(clean_label) and (
                     is_simple_segment_table or kpi_label_count >= 2
                 ):
                     unit_match = re.search(r"[（(]([^）)]+)[）)]", clean_label)

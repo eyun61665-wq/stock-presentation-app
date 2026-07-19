@@ -38,6 +38,10 @@ def _proposal(
     rates: tuple[float, float, float],
     target_year: str,
     confidence: str,
+    source_title: str = "",
+    source_url: str = "",
+    context_category: str = "",
+    published: str = "",
 ) -> dict:
     low, standard, high = _impact(reference_sales, rates)
     return {
@@ -53,6 +57,10 @@ def _proposal(
         "high_impact": high,
         "target_year": target_year,
         "confidence": confidence,
+        "source_title": source_title,
+        "source_url": source_url,
+        "context_category": context_category,
+        "published": published,
         "formula": f"{reference_label} {reference_sales:,.0f}百万円 × 影響率 {rates[1]:g}％",
         "assumption": (
             f"弱気{rates[0]:g}％・標準{rates[1]:g}％・強気{rates[2]:g}％で試算。"
@@ -65,6 +73,7 @@ def suggest_catalysts(
     project: dict,
     pl_entries: list[dict],
     segment_entries: list[dict],
+    external_context: list[dict] | None = None,
     limit: int = 4,
 ) -> list[dict]:
     """根拠が追える候補だけを返し、外部事実や未確認数値は作らない。"""
@@ -79,6 +88,31 @@ def suggest_catalysts(
     fiscal_year = str(latest_actual.get("fiscal_year", ""))
     target_year = next_fiscal_year(fiscal_year)
     proposals: list[dict] = []
+
+    for context in external_context or []:
+        category = str(context.get("category") or "企業・市場動向")
+        rates = {
+            "法令・ルール変更": (0.5, 2.0, 5.0),
+            "技術進化": (0.5, 2.5, 6.0),
+            "企業・市場動向": (0.5, 2.0, 4.0),
+        }.get(category, (0.5, 2.0, 4.0))
+        title = str(context.get("title") or "公開情報による需要変化")
+        proposals.append(_proposal(
+            f"{category}：{title[:34]}",
+            f"公開情報「{title}」を起点に、受注数・顧客数・単価のどれへ影響するかを確認する候補です。"
+            "記事の存在は根拠ですが、売上影響率は検討用の仮定です。",
+            company_sales,
+            f"{fiscal_year} 全社売上",
+            rates,
+            target_year,
+            "公開情報あり・影響率は仮定",
+            source_title=str(context.get("source") or title),
+            source_url=str(context.get("url") or ""),
+            context_category=category,
+            published=str(context.get("published") or ""),
+        ))
+        if len(proposals) >= limit:
+            return proposals[:limit]
 
     segment_actuals = [
         row for row in segment_entries

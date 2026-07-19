@@ -63,3 +63,26 @@ def test_eir_code_can_be_loaded_from_external_script(monkeypatch, tmp_path):
     assert documents == [
         {"url": "https://example.test/fy.pdf", "title": "2025年12月期決算短信"}
     ]
+
+
+def test_irpocket_javascript_documents_are_loaded_as_utf8(monkeypatch, tmp_path):
+    import data_sources
+    monkeypatch.setattr(data_sources, "CACHE_DIR", tmp_path)
+
+    class IRPocketSession:
+        def get(self, url, **kwargs):
+            if url == "https://example.test/ir/":
+                return Response('<script src="//irpocket.com/4417/irpocket/loader.js"></script>')
+            return Response(
+                'window.ir20handler({"item":[{"title":"2026年3月期 決算説明資料",'
+                '"icon":"pdf","link":"//pdf.irpocket.com/C4417/test.pdf",'
+                '"published":"2026-04-30","term_end":"2026-03-31","quarter":"4",'
+                '"category_name":"決算説明資料"}]});'
+            )
+
+    documents = fetch_ir_documents(
+        "https://example.test/ir/", refresh=True, session=IRPocketSession()
+    )
+    assert documents[0]["title"] == "2026年3月期 決算説明資料"
+    assert documents[0]["url"] == "https://pdf.irpocket.com/C4417/test.pdf"
+    assert documents[0]["quarter"] == "4"

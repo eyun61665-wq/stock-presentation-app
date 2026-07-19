@@ -140,6 +140,56 @@ def _fetch_eir_documents(html: str, ir_url: str, session=requests, timeout: int 
     return []
 
 
+def _fetch_irpocket_documents(
+    html: str, ir_url: str, session=requests, timeout: int = 20,
+) -> list[dict[str, str]]:
+    """JavaScript表示のIRPocketから、企業が公開しているPDF一覧を取得する。"""
+    match = re.search(
+        r"(?:https?:)?//irpocket\.com/([0-9A-Za-z]+)/irpocket/(?:loader|config)\.js",
+        html,
+        flags=re.I,
+    )
+    if not match:
+        return []
+    code = match.group(1)
+    feed_url = f"https://xml.irpocket.com/{code}/JS/ir-all-all.js"
+    try:
+        response = session.get(
+            feed_url,
+            headers={"User-Agent": USER_AGENT, "Referer": ir_url},
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        # JavaScriptはUTF-8固定。requestsのlatin-1推定を使わない。
+        raw = getattr(response, "content", b"")
+        script = raw.decode("utf-8", errors="replace") if raw else response.text
+    except requests.RequestException:
+        return []
+    payload_match = re.search(r"ir20handler\(\s*(\{.*\})\s*\)\s*;?", script, flags=re.S)
+    if not payload_match:
+        return []
+    try:
+        payload = json.loads(payload_match.group(1))
+    except json.JSONDecodeError:
+        return []
+    documents: list[dict[str, str]] = []
+    for item in payload.get("item", []):
+        link = str(item.get("link") or "").strip()
+        if str(item.get("icon") or "").lower() != "pdf" or not link:
+            continue
+        if link.startswith("//"):
+            link = f"https:{link}"
+        documents.append({
+            "url": urljoin(ir_url, link),
+            "title": str(item.get("title") or link.rsplit("/", 1)[-1]).strip(),
+            "published": str(item.get("published") or ""),
+            "term_end": str(item.get("term_end") or ""),
+            "quarter": str(item.get("quarter") or ""),
+            "category": str(item.get("category_name") or ""),
+        })
+    return documents
+
+
 def fetch_ir_documents(ir_url: str, refresh: bool = False, session=requests, timeout: int = 20) -> list[dict[str, str]]:
     """公式IRページのPDF一覧を取得し、通信失敗時はHTMLキャッシュへ戻る。"""
     html_path = cache_path(ir_url, ".html")
@@ -174,6 +224,11 @@ def fetch_ir_documents(ir_url: str, refresh: bool = False, session=requests, tim
         seen.add(url)
         documents.append({"url": url, "title": document["title"] or url.rsplit("/", 1)[-1]})
     for document in _fetch_eir_documents(html, ir_url, session=session, timeout=timeout):
+        if document["url"] in seen:
+            continue
+        seen.add(document["url"])
+        documents.append(document)
+    for document in _fetch_irpocket_documents(html, ir_url, session=session, timeout=timeout):
         if document["url"] in seen:
             continue
         seen.add(document["url"])

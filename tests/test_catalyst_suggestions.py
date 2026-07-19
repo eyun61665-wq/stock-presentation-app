@@ -26,3 +26,18 @@ def test_segment_based_suggestion_has_sales_impact_range():
 
 def test_no_actual_sales_returns_no_unfounded_suggestions():
     assert suggest_catalysts({}, [], []) == []
+
+
+def test_public_law_change_becomes_sourced_catalyst_with_formula():
+    pl = [{"fiscal_year": "2025.3", "result_type": "実績", "sales": 10000}]
+    context = [{
+        "title": "新ガイドラインへの対応を義務化",
+        "url": "https://example.go.jp/rule",
+        "source": "官公庁",
+        "published": "2026-01-01",
+        "category": "法令・ルール変更",
+    }]
+    result = suggest_catalysts({}, pl, [], context)
+    assert result[0]["context_category"] == "法令・ルール変更"
+    assert result[0]["source_url"] == "https://example.go.jp/rule"
+    assert result[0]["standard_impact"] == 200

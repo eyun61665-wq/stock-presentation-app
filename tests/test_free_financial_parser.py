@@ -59,6 +59,37 @@ def test_reportable_segment_matrix_extracts_external_sales_and_profit_only():
     ]
 
 
+def test_business_sales_stacked_chart_extracts_three_segments_by_year():
+    words = []
+    for x, year in ((100, "25/3期"), (200, "26/3期")):
+        words.append({"x0": x, "top": 500, "text": year})
+    for x, values in ((100, [(245, "8,801"), (337, "6,182"), (427, "997"), (461, "1,700")]),
+                      (200, [(187, "11,022"), (294, "7,197"), (403, "1,498"), (452, "2,416")])):
+        words.extend({"x0": x, "top": top, "text": value} for top, value in values)
+    layouts = [{
+        "page": 15,
+        "width": 800,
+        "text": (
+            "事業別売上高・売上総利益\n売上高（単位：百万円）\n"
+            "サイバーセキュリティ事業        サイバーセキュリティ事業\n"
+            "セキュリティ教育事業        セキュリティ教育事業\n"
+            "セキュリティ人材事業        セキュリティ人材事業"
+        ),
+        "words": words,
+        "tables": [],
+    }]
+    result = parse_layout_tables(layouts, "決算説明資料", "https://example.test/p.pdf", "now")
+    assert [(row["fiscal_year"], row["segment_name"], row["sales"])
+            for row in result["segment_records"]] == [
+        ("2025.3", "サイバーセキュリティ事業", 6182),
+        ("2025.3", "セキュリティ人材事業", 1700),
+        ("2025.3", "セキュリティ教育事業", 997),
+        ("2026.3", "サイバーセキュリティ事業", 7197),
+        ("2026.3", "セキュリティ人材事業", 2416),
+        ("2026.3", "セキュリティ教育事業", 1498),
+    ]
+
+
 def test_notes_and_balance_sheet_rows_are_not_misclassified_as_segments():
     layouts = [{
         "page": 9,
