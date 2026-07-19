@@ -128,7 +128,10 @@ def _source_label(filename: str, page: int | None) -> str:
     return f"AI解析：{filename}" + (f" p.{page}" if page else "")
 
 
-def normalize_ai_result(payload: dict[str, Any], filename: str, source_url: str) -> dict[str, Any]:
+def normalize_ai_result(
+    payload: dict[str, Any], filename: str, source_url: str,
+    source_prefix: str = "AI解析",
+) -> dict[str, Any]:
     """AIの構造化結果を既存のSQLite保存形式へ限定して整形する。"""
     result: dict[str, Any] = {
         "pl_records": [],
@@ -152,7 +155,7 @@ def normalize_ai_result(payload: dict[str, Any], filename: str, source_url: str)
             "fiscal_year": year,
             "result_type": raw.get("result_type") if raw.get("result_type") in ("実績", "会社予想") else "実績",
             "shares_outstanding": raw.get("average_shares"),
-            "source": _source_label(filename, page),
+            "source": _source_label(filename, page).replace("AI解析", source_prefix, 1),
             "basis_date": year,
             "source_url": source_url,
             "source_page": page,
@@ -172,7 +175,7 @@ def normalize_ai_result(payload: dict[str, Any], filename: str, source_url: str)
             "segment_name": name,
             "sales": raw.get("sales"),
             "operating_profit": raw.get("operating_profit"),
-            "source": _source_label(filename, page),
+            "source": _source_label(filename, page).replace("AI解析", source_prefix, 1),
             "note": source_url,
         })
 
@@ -189,7 +192,7 @@ def normalize_ai_result(payload: dict[str, Any], filename: str, source_url: str)
             "value": raw.get("value"),
             "unit": str(raw.get("unit") or ""),
             "display_order": int(raw.get("display_order") or 0),
-            "source": _source_label(filename, page),
+            "source": _source_label(filename, page).replace("AI解析", source_prefix, 1),
             "note": source_url,
         })
     return result

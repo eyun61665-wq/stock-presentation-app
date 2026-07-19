@@ -9,6 +9,7 @@ from financial_parser import parse_detailed_pl, parse_segment_statements
 from free_financial_parser import extract_pdf_layout, parse_layout_tables
 from pdf_financial_extractor import extract_pdf_pages
 from ai_financial_parser import AIFinancialParserError, OpenAIFinancialParser
+from gemini_financial_parser import GeminiFinancialParser, GeminiFinancialParserError
 
 
 EXCLUDED_ANNUAL_TITLE_WORDS = (
@@ -245,14 +246,14 @@ def load_official_financials(
     }
 
 
-def load_official_financials_with_ai(
+def _load_official_financials_with_parser(
     ir_url: str,
-    api_key: str,
-    model: str,
+    parser: OpenAIFinancialParser | GeminiFinancialParser,
+    provider_label: str,
     max_years: int = 3,
     refresh: bool = False,
 ) -> dict[str, Any]:
-    """通常解析で不足した公開PDFをOpenAIへ送り、検証可能な候補を返す。"""
+    """通常解析で不足した公開PDFをAIへ送り、検証可能な候補を返す。"""
     documents = select_annual_documents(
         fetch_ir_documents(ir_url, refresh=refresh),
         max_documents=max_years + 2,
@@ -262,7 +263,6 @@ def load_official_financials_with_ai(
             "pl_records": [], "segment_records": [], "segment_metrics": [],
             "documents": [], "warnings": ["AI解析対象の本決算資料を見つけられませんでした。"],
         }
-    parser = OpenAIFinancialParser(api_key, model=model)
     pl_by_key: dict[tuple[str, str], dict[str, Any]] = {}
     segments_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
     metrics_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
@@ -272,8 +272,8 @@ def load_official_financials_with_ai(
         try:
             content, _metadata = download_pdf(document["url"], refresh=refresh)
             parsed = parser.parse_pdf(content, document["title"], document["url"])
-        except (DataSourceError, OSError, ValueError, AIFinancialParserError) as exc:
-            warnings.append(f"「{document['title']}」のAI解析を完了できませんでした：{exc}")
+        except (DataSourceError, OSError, ValueError, AIFinancialParserError, GeminiFinancialParserError) as exc:
+            warnings.append(f"「{document['title']}」の{provider_label}解析を完了できませんでした：{exc}")
             continue
         if parsed["pl_records"] or parsed["segment_records"] or parsed["segment_metrics"]:
             used_documents.append(document)
@@ -303,6 +303,34 @@ def load_official_financials_with_ai(
         "documents": used_documents,
         "warnings": warnings,
     }
+
+
+def load_official_financials_with_ai(
+    ir_url: str,
+    api_key: str,
+    model: str,
+    max_years: int = 3,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    """不足した公開PDFをOpenAIで補助解析する後方互換入口。"""
+    return _load_official_financials_with_parser(
+        ir_url, OpenAIFinancialParser(api_key, model=model), "OpenAI",
+        max_years=max_years, refresh=refresh,
+    )
+
+
+def load_official_financials_with_gemini(
+    ir_url: str,
+    api_key: str,
+    model: str,
+    max_years: int = 3,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    """不足した公開PDFをGemini無料枠で補助解析する。"""
+    return _load_official_financials_with_parser(
+        ir_url, GeminiFinancialParser(api_key, model=model), "Gemini",
+        max_years=max_years, refresh=refresh,
+    )
 
 
 def select_recent_pl_records(records: list[dict], max_actual_years: int = 3) -> list[dict]:

@@ -34,10 +34,12 @@ from pdf_financial_extractor import extract_pdf_pages
 from data_sources import DataSourceError, download_pdf, fetch_ir_pdf_links
 from financial_parser import PL_ITEMS, parse_pl_text
 from financial_document_service import (load_official_financials, load_official_financials_with_ai,
+                                          load_official_financials_with_gemini,
                                           merge_imported_pl, merge_imported_segments,
                                           merge_imported_segment_metrics,
                                           parse_financial_document, select_recent_pl_records)
 from ai_financial_parser import AIFinancialParserError, OpenAIFinancialParser
+from gemini_financial_parser import GeminiFinancialParser, GeminiFinancialParserError
 from ir_source_discovery import (IRSourceDiscoveryError, VERIFIED_IR_SOURCES,
                                  discover_ir_source)
 from exporter import pl_to_csv, pl_to_excel
@@ -219,6 +221,27 @@ def get_openai_financial_model() -> str:
         return "gpt-5.6-luna"
 
 
+def get_gemini_api_key() -> str | None:
+    """Geminiキーは環境変数またはStreamlit Secretsからだけ読み込む。"""
+    key = os.getenv("GEMINI_API_KEY")
+    if key:
+        return key
+    try:
+        return st.secrets.get("GEMINI_API_KEY")
+    except Exception:
+        return None
+
+
+def get_gemini_financial_model() -> str:
+    model = os.getenv("GEMINI_FINANCIAL_MODEL")
+    if model:
+        return model
+    try:
+        return str(st.secrets.get("GEMINI_FINANCIAL_MODEL", "gemini-2.5-flash"))
+    except Exception:
+        return "gemini-2.5-flash"
+
+
 def get_edinet_api_key() -> str | None:
     """無料EDINETキーもソースやSQLiteへ保存しない。"""
     key = os.getenv("EDINET_API_KEY")
@@ -280,6 +303,25 @@ def cached_ai_official_financials(
     if not api_key:
         raise AIFinancialParserError("OPENAI_API_KEYが設定されていません。")
     return load_official_financials_with_ai(
+        ir_url,
+        api_key,
+        model,
+        max_years=max_years,
+        refresh=bool(refresh_nonce),
+    )
+
+
+@st.cache_data(ttl="24h", max_entries=20, show_spinner=False)
+def cached_gemini_official_financials(
+    ir_url: str,
+    model: str,
+    max_years: int,
+    refresh_nonce: int,
+) -> dict:
+    api_key = get_gemini_api_key()
+    if not api_key:
+        raise GeminiFinancialParserError("GEMINI_API_KEYが設定されていません。")
+    return load_official_financials_with_gemini(
         ir_url,
         api_key,
         model,
@@ -987,6 +1029,18 @@ def _uploaded_ai_result(files: list, model: str) -> dict:
     return result
 
 
+def _uploaded_gemini_result(files: list, model: str) -> dict:
+    api_key = get_gemini_api_key()
+    if not api_key:
+        raise GeminiFinancialParserError("GEMINI_API_KEYが設定されていません。")
+    parser = GeminiFinancialParser(api_key, model=model)
+    result = {"pl_records": [], "segment_records": [], "segment_metrics": [], "warnings": [], "documents": []}
+    for uploaded in files[:5]:
+        parsed = parser.parse_pdf(uploaded.getvalue(), uploaded.name, "アップロード")
+        result = merge_financial_previews(result, parsed)
+    return result
+
+
 def _apply_financial_result(project_id: int, result: dict, location: str) -> int:
     """取得結果のうち、開いている画面の表だけをSQLiteへ反映する。"""
     if location == "pl":
@@ -1049,8 +1103,14 @@ def financial_document_import_panel(project: dict, location: str) -> None:
         if source_url:
             source_method = (source_info or {}).get("method", "保存済み公式IR")
             heading.caption(f"取得先：{company_name or stock_code} 公式IR（{source_method}）")
-        ai_available = bool(get_openai_api_key())
+        gemini_available = bool(get_gemini_api_key())
+        openai_available = bool(get_openai_api_key())
         heading.caption("無料解析：決算短信の文字・罫線・表レイアウトを組み合わせて抽出します。")
+        heading.caption(
+            "Gemini無料補助：有効（通常解析の空欄だけ自動補完）"
+            if gemini_available else
+            "Gemini無料補助：未設定（設定後は不足項目だけ自動補完）"
+        )
         heading.caption(
             "EDINET XBRL：有効（無料）"
             if get_edinet_api_key() else
@@ -1069,7 +1129,7 @@ def financial_document_import_panel(project: dict, location: str) -> None:
                 accept_multiple_files=True,
                 key=f"document_upload_{location}_{project_id}",
             )
-            if ai_available:
+            if openai_available:
                 use_paid_ai = st.checkbox(
                     "有料のOpenAI補助を使う",
                     value=False,
@@ -1077,7 +1137,7 @@ def financial_document_import_panel(project: dict, location: str) -> None:
                     help="通常はオフのままで無料です。オンにした取得だけAPI料金が発生します。",
                 )
             else:
-                st.caption("有料AIは未設定です。無料解析だけで動作します。")
+                st.caption("OpenAI有料補助は未設定です。無料解析とGeminiだけで動作します。")
         fetch_clicked = action.button(
             f"{target_label}情報を取得",
             type="primary",
@@ -1115,6 +1175,17 @@ def financial_document_import_panel(project: dict, location: str) -> None:
                             result,
                             jquants_financial_fallback(stock_code, nonce),
                         )
+                    if gemini_available and _financial_result_needs_ai(result, location):
+                        try:
+                            gemini_result = cached_gemini_official_financials(
+                                source_info["url"], get_gemini_financial_model(), 3, nonce,
+                            )
+                            result = merge_financial_previews(result, gemini_result)
+                            result.setdefault("warnings", []).append(
+                                "通常解析で不足した項目をGemini無料枠で補助抽出しました。出典ページを確認してください。"
+                            )
+                        except GeminiFinancialParserError as gemini_exc:
+                            result.setdefault("warnings", []).append(str(gemini_exc))
                     if use_paid_ai and _financial_result_needs_ai(result, location):
                         try:
                             ai_result = cached_ai_official_financials(
@@ -1184,6 +1255,17 @@ def financial_document_import_panel(project: dict, location: str) -> None:
         if uploaded and upload_signature != st.session_state.get(upload_signature_key):
             with st.spinner("アップロードしたPDFを解析しています…"):
                 result = _uploaded_financial_result(uploaded)
+                if gemini_available and _financial_result_needs_ai(result, location):
+                    try:
+                        result = merge_financial_previews(
+                            result,
+                            _uploaded_gemini_result(uploaded, get_gemini_financial_model()),
+                        )
+                        result.setdefault("warnings", []).append(
+                            "通常解析で不足した項目をGemini無料枠で補助抽出しました。出典ページを確認してください。"
+                        )
+                    except GeminiFinancialParserError as gemini_exc:
+                        result.setdefault("warnings", []).append(str(gemini_exc))
                 if use_paid_ai and _financial_result_needs_ai(result, location):
                     try:
                         result = merge_financial_previews(

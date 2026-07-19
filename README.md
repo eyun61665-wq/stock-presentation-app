@@ -90,6 +90,24 @@ EDINET_API_KEY = "発行したAPIキー"
 
 PDFはローカルにキャッシュされ、同じURLは「その他」のキャッシュ更新を選ぶまで再ダウンロードしません。「その他」からPDFを複数アップロードする方法も利用できます。資料にない値は推測せず、空欄のまま手入力できます。
 
+## Gemini無料枠によるPDF補助解析（推奨・任意）
+
+通常のPython解析でPLの詳細行やセグメントが不足した場合だけ、Gemini APIへ公開決算PDFを送り、構造化データとして補助抽出します。PDFを直接理解でき、JSON Schemaで返却形式を制限します。Geminiキーがなくても従来機能はすべて動作します。
+
+会社のGemini Pro画面利用権とは別に、Google AI StudioでGemini APIキーを発行してください。ローカルでは環境変数、公開版ではStreamlit Community CloudのSecretsへ次を設定します。キーはソースコードやSQLiteへ保存されません。
+
+```toml
+GEMINI_API_KEY = "Google AI Studioで発行したAPIキー"
+# 任意。無料枠対象モデルを指定します。
+GEMINI_FINANCIAL_MODEL = "gemini-2.5-flash"
+```
+
+処理順は「無料のPDF表解析 → EDINET XBRL/J-Quants → 不足項目だけGemini」です。同じ資料のGemini結果は24時間キャッシュします。無料枠の上限に達した場合は追加課金へ勝手に切り替えず、従来解析と手入力へ戻ります。返却値には推測禁止、連結優先、通期累計、出典ページ必須を指示していますが、必ず原文と照合してください。
+
+- [Gemini APIキー](https://ai.google.dev/gemini-api/docs/api-key)
+- [GeminiのPDF解析](https://ai.google.dev/gemini-api/docs/document-processing)
+- [Geminiの構造化出力](https://ai.google.dev/gemini-api/docs/structured-output)
+
 ## OpenAIによるPDF補助解析（任意）
 
 通常のPython解析でPLの詳細行やセグメントを取得できなかった場合だけ、OpenAI Responses APIへ公開決算PDFを送り、構造化データとして補助抽出できます。これは完全な任意機能で、初期状態ではオフです。無料で使う場合は設定不要で、公式PDF解析、EDINET XBRL、J-Quants、手入力を利用できます。
@@ -102,7 +120,7 @@ OPENAI_API_KEY = "発行したOpenAI APIキー"
 OPENAI_FINANCIAL_MODEL = "gpt-5.6-luna"
 ```
 
-処理順は「無料のPDF表解析 → EDINET XBRL/J-Quants等の構造化データ」です。画面の「その他」で「有料のOpenAI補助を使う」を明示的にオンにした取得だけAIを使います。AIには推測禁止、連結優先、通期累計、出典ページ必須を指示し、返却形式をJSON Schemaで制限しています。それでも誤抽出の可能性はあるため、画面に表示される資料名・ページ番号と原文を照合してください。OpenAI APIをオンにした場合だけAPI料金が発生します。
+処理順は「通常解析 → Gemini無料補助 → 必要な場合だけOpenAI」です。画面の「その他」で「有料のOpenAI補助を使う」を明示的にオンにした取得だけOpenAIを使います。OpenAI APIをオンにした場合だけOpenAI側の料金が発生します。
 
 - [OpenAI API quickstart](https://developers.openai.com/api/docs/quickstart)
 - [OpenAI API file inputs](https://developers.openai.com/api/docs/guides/file-inputs)
