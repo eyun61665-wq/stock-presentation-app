@@ -1,6 +1,6 @@
 import pytest
 
-from calculations import (catalyst_additional_sales, catalyst_sales_from_rate, eps, market_capitalization,
+from calculations import (catalyst_additional_sales, catalyst_price_impact, catalyst_sales_from_rate, eps, market_capitalization,
                           operating_margin, scenario_calculation)
 
 
@@ -22,6 +22,13 @@ def test_catalyst_additional_sales_uses_percent_input():
 
 def test_catalyst_sales_from_base_sales_rate():
     assert catalyst_sales_from_rate(2_000, 5) == pytest.approx(100)
+
+
+def test_catalyst_price_impact_is_shown_as_percent():
+    result = catalyst_price_impact(100, 20, 30, 10, 20, 1_000)
+    assert result["eps_uplift"] == pytest.approx(1.4)
+    assert result["price_uplift"] == pytest.approx(28)
+    assert result["impact_percent"] == pytest.approx(2.8)
 
 
 def test_target_price():

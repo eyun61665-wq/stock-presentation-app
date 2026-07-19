@@ -190,6 +190,47 @@ def _fetch_irpocket_documents(
     return documents
 
 
+def _fetch_xj_storage_documents(
+    html: str, ir_url: str, session=requests, timeout: int = 20,
+) -> list[dict[str, str]]:
+    """XJ-Storageで動的表示される公式IR資料を公開JSONから取得する。"""
+    match = re.search(
+        r"(?:https?:)?//www\.xj-storage\.jp/resources/([0-9A-Za-z]+)/[^\"']+\.js",
+        html,
+        flags=re.I,
+    )
+    if not match:
+        return []
+    company_id = match.group(1)
+    try:
+        response = session.get(
+            "https://www.xj-storage.jp/public-list/GetList2.aspx",
+            params={"company": company_id, "len": 10000, "output": "json"},
+            headers={"User-Agent": USER_AGENT, "Referer": ir_url},
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        payload = json.loads(_response_text(response))
+    except (requests.RequestException, json.JSONDecodeError, TypeError):
+        return []
+    documents: list[dict[str, str]] = []
+    for item in payload.get("items", []):
+        files = item.get("files") or []
+        pdf = next(
+            (row for row in files if row.get("type") == "PDF-GENERAL" and row.get("url")),
+            next((row for row in files if str(row.get("type", "")).startswith("PDF") and row.get("url")), None),
+        )
+        if not pdf:
+            continue
+        documents.append({
+            "url": str(pdf["url"]),
+            "title": str(item.get("title") or "公式IR資料").strip(),
+            "published": str(item.get("publishDate") or ""),
+            "category": str(item.get("categoryName") or ""),
+        })
+    return documents
+
+
 def fetch_ir_documents(ir_url: str, refresh: bool = False, session=requests, timeout: int = 20) -> list[dict[str, str]]:
     """公式IRページのPDF一覧を取得し、通信失敗時はHTMLキャッシュへ戻る。"""
     html_path = cache_path(ir_url, ".html")
@@ -229,6 +270,11 @@ def fetch_ir_documents(ir_url: str, refresh: bool = False, session=requests, tim
         seen.add(document["url"])
         documents.append(document)
     for document in _fetch_irpocket_documents(html, ir_url, session=session, timeout=timeout):
+        if document["url"] in seen:
+            continue
+        seen.add(document["url"])
+        documents.append(document)
+    for document in _fetch_xj_storage_documents(html, ir_url, session=session, timeout=timeout):
         if document["url"] in seen:
             continue
         seen.add(document["url"])

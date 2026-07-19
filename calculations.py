@@ -38,6 +38,27 @@ def catalyst_sales_from_rate(base_sales_million: float, impact_rate_percent: flo
     return base_sales_million * impact_rate_percent / 100
 
 
+def catalyst_price_impact(additional_sales_million: float, incremental_margin_percent: float,
+                          effective_tax_rate_percent: float, average_shares_million: float,
+                          per: float, current_price_yen: float) -> dict[str, float | None]:
+    """追加売上からEPS増分・株価増分・現在株価比を段階的に試算する。"""
+    operating_profit = additional_sales_million * incremental_margin_percent / 100
+    net_income = operating_profit * (1 - effective_tax_rate_percent / 100)
+    eps_uplift = eps(net_income, average_shares_million)
+    price_uplift = None if eps_uplift is None else eps_uplift * per
+    impact_percent = (
+        None if price_uplift is None or current_price_yen in (None, 0)
+        else price_uplift / current_price_yen * 100
+    )
+    return {
+        "operating_profit": operating_profit,
+        "net_income": net_income,
+        "eps_uplift": eps_uplift,
+        "price_uplift": price_uplift,
+        "impact_percent": impact_percent,
+    }
+
+
 def scenario_calculation(base_sales: float, existing_sales_growth_percent: float,
                          catalyst_sales: float, operating_margin_percent: float,
                          effective_tax_rate_percent: float, average_shares_million: float,

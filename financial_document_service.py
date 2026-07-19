@@ -62,11 +62,22 @@ def parse_financial_document(
     pages = extract_pdf_pages(content, max_pages=60)
     layouts = extract_pdf_layout(content, max_pages=60)
     if not pages or not any(page.strip() for page in pages):
-        return {"pl_records": [], "segment_records": [], "segment_metrics": [], "warnings": [f"{source_name}は画像PDFまたは文字抽出できないPDFです。"]}
+        return {"pl_records": [], "segment_records": [], "segment_metrics": [], "single_segment_name": "", "warnings": [f"{source_name}は画像PDFまたは文字抽出できないPDFです。"]}
+    combined_text = "\n".join(pages)
+    single_match = re.search(
+        r"(?:当社(?:グループ)?は)?\s*([^\n。、]{2,40}?事業)の単一セグメント",
+        combined_text,
+    )
+    single_segment_name = ""
+    if single_match:
+        single_segment_name = re.sub(
+            r"^当社(?:グループ)?は\s*", "", single_match.group(1)
+        ).strip()
     standard = {
         "pl_records": parse_detailed_pl(pages, source_name, source_url, retrieved_at),
         "segment_records": parse_segment_statements(pages, source_name, source_url, retrieved_at),
         "segment_metrics": [],
+        "single_segment_name": single_segment_name,
         "warnings": [],
     }
     layout_result = parse_layout_tables(layouts, source_name, source_url, retrieved_at)
@@ -183,6 +194,22 @@ def load_official_financials(
             normalized["fiscal_year"] = _period_key(row["fiscal_year"])
             key = (normalized["fiscal_year"], str(row["segment_name"]))
             segments_by_key.setdefault(key, normalized)
+        if parsed.get("single_segment_name") and not parsed["segment_records"]:
+            segment_name = str(parsed["single_segment_name"])
+            for row in parsed["pl_records"]:
+                if str(row.get("result_type", "実績")) != "実績" or row.get("sales") in (None, ""):
+                    continue
+                normalized = {
+                    "fiscal_year": _period_key(row["fiscal_year"]),
+                    "result_type": "実績",
+                    "segment_name": segment_name,
+                    "sales": row.get("sales"),
+                    "operating_profit": row.get("operating_profit"),
+                    "source": "決算短信PDF（単一セグメント）",
+                    "note": str(row.get("source_url") or ""),
+                }
+                key = (normalized["fiscal_year"], segment_name)
+                segments_by_key.setdefault(key, normalized)
         for row in parsed.get("segment_metrics", []):
             normalized = dict(row)
             normalized["fiscal_year"] = _period_key(row["fiscal_year"])
@@ -191,10 +218,9 @@ def load_official_financials(
                 str(row["row_label"]),
             )
             metrics_by_key.setdefault(key, normalized)
-        if len(pl_by_year) >= max_years:
-            break
-
     selected_years = sorted(pl_by_year)[-max_years:]
+    if not selected_years:
+        selected_years = sorted({key[0] for key in segments_by_key})[-max_years:]
     pl_records: list[dict[str, Any]] = []
     for year in selected_years:
         record = dict(pl_by_year[year])

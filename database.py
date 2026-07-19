@@ -8,7 +8,7 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = BASE_DIR / "stock_projects.db"
-SCHEMA_VERSION = "9"
+SCHEMA_VERSION = "10"
 API_PROJECT_COLUMNS = {
     "company_name_en": "TEXT DEFAULT ''", "market": "TEXT DEFAULT ''", "sector17": "TEXT DEFAULT ''",
     "sector33": "TEXT DEFAULT ''", "price_date": "TEXT DEFAULT ''", "data_retrieved_at": "TEXT DEFAULT ''",
@@ -29,6 +29,9 @@ TABLE_MIGRATION_COLUMNS = {
         "calculation_method": "TEXT DEFAULT '数量モデル'",
         "base_sales": "REAL",
         "impact_rate": "REAL",
+        "incremental_margin": "REAL",
+        "effective_tax_rate": "REAL",
+        "valuation_per": "REAL",
     },
 }
 
@@ -117,6 +120,8 @@ def initialize_database(db_path: str | Path = DEFAULT_DB_PATH) -> None:
                 target_count REAL NOT NULL DEFAULT 0, target_rate REAL NOT NULL DEFAULT 0,
                 capture_rate REAL NOT NULL DEFAULT 0, price_per_case REAL NOT NULL DEFAULT 0,
                 evidence_category TEXT DEFAULT '自分の仮定', source TEXT DEFAULT '', note TEXT DEFAULT '',
+                calculation_method TEXT DEFAULT '数量モデル', base_sales REAL, impact_rate REAL,
+                incremental_margin REAL, effective_tax_rate REAL, valuation_per REAL,
                 FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
             );
             CREATE TABLE IF NOT EXISTS scenarios (
@@ -311,8 +316,12 @@ def save_catalyst(project_id: int, catalyst: dict, db_path: str | Path = DEFAULT
         "catalyst_name", "target_year", "description", "target_count", "target_rate",
         "capture_rate", "price_per_case", "evidence_category", "source", "note",
         "calculation_method", "base_sales", "impact_rate",
+        "incremental_margin", "effective_tax_rate", "valuation_per",
     ]
-    defaults = {"calculation_method": "数量モデル", "base_sales": None, "impact_rate": None}
+    defaults = {
+        "calculation_method": "数量モデル", "base_sales": None, "impact_rate": None,
+        "incremental_margin": None, "effective_tax_rate": None, "valuation_per": None,
+    }
     values = [catalyst.get(field, defaults.get(field, "")) for field in fields]
     with get_connection(db_path) as conn:
         conn.execute(f"""INSERT INTO catalysts (project_id, {', '.join(fields)}) VALUES (?, {', '.join('?' for _ in fields)})

@@ -22,6 +22,7 @@ VERIFIED_IR_SOURCES = {
     "7713": "https://www.sigma-koki.com/document_category/tansin/",
     "4343": "https://www.fantasy.co.jp/company/ircontent/library/library_02.html",
     "4417": "https://www.gsx.co.jp/ir/library/summary/",
+    "5246": "https://ir.elementsinc.jp/library/",
 }
 
 EXCLUDED_HOSTS = (

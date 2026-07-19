@@ -8,7 +8,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-from calculations import (catalyst_additional_sales, catalyst_sales_from_rate, eps, market_capitalization,
+from calculations import (catalyst_additional_sales, catalyst_price_impact, catalyst_sales_from_rate, eps, market_capitalization,
                           operating_margin, sales_growth_rate, scenario_calculation)
 from catalyst_suggestion_service import suggest_catalysts
 from catalyst_research_service import research_catalyst_context
@@ -758,33 +758,50 @@ def ir_pl_panel(project: dict | None) -> None:
 
 
 def simple_company_data_panel(project: dict | None) -> None:
-    """銘柄コードから企業・株価・本決算PLをまとめて取得する簡易入口。"""
+    """銘柄コードまたは会社名から企業・株価・本決算PLをまとめて取得する入口。"""
     st.subheader("企業・決算データ取得")
-    st.caption("4桁の銘柄コードを入力して、Enterキーまたはボタンを押してください。保存済みのPL・セグメントがあれば一緒に開きます。")
+    st.caption("4桁の銘柄コードまたは会社名を入力してください。会社名が曖昧な場合は近い候補を表示します。")
     current = project or {}
     api_key = get_jquants_api_key()
+    pending_code = st.session_state.pop("simple_selected_company_code", "")
     feedback = st.session_state.pop("simple_lookup_feedback", None)
     if feedback:
         getattr(st, feedback[0])(feedback[1])
 
     with st.form("simple_company_lookup_form"):
         code = st.text_input(
-            "銘柄コード（4桁）",
-            value=current.get("stock_code", ""),
+            "銘柄コード（4桁）または会社名",
+            value=pending_code or current.get("stock_code", ""),
             key="simple_fetch_code",
-            placeholder="例：7713",
+            placeholder="例：7713、シグマ光機、ELEMENTS",
         )
         submitted = st.form_submit_button("この銘柄を開く・取得", type="primary")
+    submitted = submitted or bool(pending_code)
 
     if not api_key:
         st.info("J-Quants未設定でも、保存済みデータと無料のJPX企業マスターを利用できます。株価など一部の自動取得だけ利用できない場合があります。")
 
     if submitted:
+        normalized_code = ""
         try:
             normalized_code = display_code(code.strip())
-        except ValueError as exc:
-            st.warning(str(exc))
-        else:
+            st.session_state.pop("simple_company_candidates", None)
+        except ValueError:
+            try:
+                master_rows, _ = get_master()
+                matches = search_master(master_rows, code.strip())
+            except JPXMasterError as exc:
+                st.error(f"企業検索を利用できませんでした：{exc} 手入力機能は引き続き使えます。")
+                matches = []
+            if len(matches) == 1:
+                normalized_code = str(matches[0]["stock_code"])
+                st.session_state.pop("simple_company_candidates", None)
+            elif matches:
+                st.session_state.simple_company_candidates = matches[:15]
+                st.info("近い会社が複数見つかりました。下の候補から選んでください。")
+            else:
+                st.warning("該当する会社が見つかりませんでした。会社名の一部または4桁コードで再検索してください。")
+        if normalized_code:
             existing = find_project_by_code(list_projects(), normalized_code)
             if existing:
                 existing_id = int(existing["id"])
@@ -837,6 +854,24 @@ def simple_company_data_panel(project: dict | None) -> None:
                 if master_warning:
                     message += " JPX企業マスターは取得できなかったため、会社名は手入力してください。"
                 st.session_state.simple_lookup_feedback = ("success", message)
+                st.rerun()
+
+    candidates = st.session_state.get("simple_company_candidates") or []
+    if candidates:
+        with st.container(border=True):
+            st.markdown("#### 会社候補")
+            selected_company = st.selectbox(
+                "近い候補から選択",
+                candidates,
+                format_func=lambda row: (
+                    f"{row['stock_code']}｜{row.get('company_name', '')}｜{row.get('market', '')}"
+                ),
+                key="simple_company_candidate_choice",
+            )
+            if st.button("この会社を開く", type="primary", key="open_simple_company_candidate"):
+                st.session_state.simple_selected_company_code = selected_company["stock_code"]
+                st.session_state.pop("simple_company_candidates", None)
+                st.session_state.pop("simple_fetch_code", None)
                 st.rerun()
 
     preview = st.session_state.get("simple_company_preview")
@@ -1495,6 +1530,21 @@ def catalyst_page() -> None:
     pl_entries = get_pl_entries(project_id)
     segment_entries = get_segment_entries(project_id)
 
+    actual_rows = [row for row in pl_entries if row.get("result_type") == "実績"]
+    latest_actual = actual_rows[-1] if actual_rows else {}
+    latest_sales = number(latest_actual.get("sales"))
+    latest_operating_profit = number(latest_actual.get("operating_profit"))
+    default_margin = (
+        latest_operating_profit / latest_sales * 100 if latest_sales > 0 else 10.0
+    )
+    default_shares = (
+        number(project.get("shares_outstanding"))
+        or number(latest_actual.get("shares_outstanding"))
+    )
+    current_price = number(project.get("current_price"))
+    latest_eps = eps(number(latest_actual.get("net_income")), default_shares) if default_shares else None
+    default_per = current_price / latest_eps if current_price > 0 and latest_eps and latest_eps > 0 else 15.0
+
     category_default = stored.get("evidence_category", "自分の仮定")
     method_default = stored.get("calculation_method", "数量モデル")
     if category_default not in EVIDENCE_CATEGORIES:
@@ -1512,6 +1562,9 @@ def catalyst_page() -> None:
         f"price_{project_id}": number(stored.get("price_per_case")),
         f"cat_base_sales_{project_id}": number(stored.get("base_sales")),
         f"cat_impact_rate_{project_id}": number(stored.get("impact_rate")),
+        f"cat_incremental_margin_{project_id}": number(stored.get("incremental_margin")) or default_margin,
+        f"cat_tax_rate_{project_id}": number(stored.get("effective_tax_rate")) or 30.0,
+        f"cat_valuation_per_{project_id}": number(stored.get("valuation_per")) or default_per,
         f"cat_category_{project_id}": category_default,
         f"cat_source_{project_id}": stored.get("source", ""),
         f"cat_note_{project_id}": stored.get("note", ""),
@@ -1525,16 +1578,26 @@ def catalyst_page() -> None:
     suggestions = suggest_catalysts(project, pl_entries, segment_entries, external_context)
     with st.container(border=True):
         st.subheader("カタリスト候補")
-        st.caption("企業周辺の公開情報、技術進化、法令・制度・業界ルールと、保存済みPL・セグメントから候補を作ります。売上影響率は検討用の仮定です。")
+        st.caption("企業周辺の公開情報、技術進化、法令・制度・業界ルールから候補を作り、株価への影響率を試算します。")
         if not suggestions:
             st.info("実績売上をPLへ保存すると、カタリスト候補と売上影響レンジを表示できます。")
         else:
+            suggestion_margin = number(st.session_state[f"cat_incremental_margin_{project_id}"])
+            suggestion_tax = number(st.session_state[f"cat_tax_rate_{project_id}"])
+            suggestion_per = number(st.session_state[f"cat_valuation_per_{project_id}"])
+
+            def suggestion_impact(additional_sales: float) -> float | None:
+                return catalyst_price_impact(
+                    additional_sales, suggestion_margin, suggestion_tax,
+                    default_shares, suggestion_per, current_price,
+                )["impact_percent"]
+
             comparison = pd.DataFrame([
                 {
                     "候補": row["name"],
-                    "弱気（百万円）": row["low_impact"],
-                    "標準（百万円）": row["standard_impact"],
-                    "強気（百万円）": row["high_impact"],
+                    "弱気（株価％）": suggestion_impact(row["low_impact"]),
+                    "標準（株価％）": suggestion_impact(row["standard_impact"]),
+                    "強気（株価％）": suggestion_impact(row["high_impact"]),
                     "根拠強度": row["confidence"],
                 }
                 for row in suggestions
@@ -1543,9 +1606,9 @@ def catalyst_page() -> None:
                 comparison,
                 hide_index=True,
                 column_config={
-                    "弱気（百万円）": st.column_config.NumberColumn(format="%,.0f"),
-                    "標準（百万円）": st.column_config.NumberColumn(format="%,.0f"),
-                    "強気（百万円）": st.column_config.NumberColumn(format="%,.0f"),
+                    "弱気（株価％）": st.column_config.NumberColumn(format="%.1f%%"),
+                    "標準（株価％）": st.column_config.NumberColumn(format="%.1f%%"),
+                    "強気（株価％）": st.column_config.NumberColumn(format="%.1f%%"),
                 },
             )
             selected = st.selectbox(
@@ -1564,10 +1627,14 @@ def catalyst_page() -> None:
                 if selected.get("published"):
                     st.caption(f"公開日時：{selected['published']}")
             low, standard, high = metric_slots(3)
-            low.metric("弱気の追加売上", f"{selected['low_impact']:,.0f}百万円", f"影響率 {selected['low_rate']:g}％")
-            standard.metric("標準の追加売上", f"{selected['standard_impact']:,.0f}百万円", f"影響率 {selected['standard_rate']:g}％")
-            high.metric("強気の追加売上", f"{selected['high_impact']:,.0f}百万円", f"影響率 {selected['high_rate']:g}％")
-            st.caption(f"標準ケースの式：{selected['formula']} ＝ {selected['standard_impact']:,.0f}百万円")
+            selected_impacts = [suggestion_impact(selected[key]) for key in ("low_impact", "standard_impact", "high_impact")]
+            for slot, label, value in zip((low, standard, high), ("弱気", "標準", "強気"), selected_impacts):
+                slot.metric(f"{label}の株価影響", "算出不可" if value is None else f"+{value:,.1f}％")
+            if any(value is None for value in selected_impacts):
+                st.info("株価影響を出すには、会社概要で現在株価と株式数を入力してください。")
+            with st.expander("株価影響の計算根拠"):
+                st.write(f"標準ケースの追加売上：{selected['standard_impact']:,.0f}百万円")
+                st.code("追加売上 × 増分営業利益率 × (1－税率) ÷ 株式数 × PER ÷ 現在株価 × 100")
             if st.button("標準ケースを入力欄へ反映", icon=":material/south:", key=f"adopt_catalyst_suggestion_{project_id}"):
                 st.session_state[f"cat_name_{project_id}"] = selected["name"]
                 st.session_state[f"cat_year_{project_id}"] = selected["target_year"]
@@ -1584,7 +1651,7 @@ def catalyst_page() -> None:
                 st.session_state[f"cat_note_{project_id}"] = selected["assumption"]
                 st.rerun()
 
-    st.caption("追加売上の単位は百万円。候補を採用した後も、率や根拠を自由に修正できます。")
+    st.caption("株価影響は入力した利益率・税率・PERに基づく試算で、将来の株価を保証するものではありません。")
     c1, c2 = responsive_columns(2)
     name = c1.text_input("カタリスト名", key=f"cat_name_{project_id}")
     year = c2.text_input("対象年度", key=f"cat_year_{project_id}")
@@ -1625,7 +1692,42 @@ def catalyst_page() -> None:
         impact_rate = number(st.session_state[f"cat_impact_rate_{project_id}"])
         additional = catalyst_additional_sales(target_count, target_rate, capture_rate, price)
         st.markdown(f"### {target_count:,.0f}件 × {target_rate:,.1f}％ × {capture_rate:,.1f}％ × {price:,.2f}百万円 ＝ **{additional:,.0f}百万円**")
-    st.metric("追加売上高（百万円）", f"{additional:,.0f}")
+    st.subheader("株価への影響")
+    p1, p2, p3 = responsive_columns(3)
+    incremental_margin = p1.number_input(
+        "増分営業利益率（％）", step=0.5, key=f"cat_incremental_margin_{project_id}"
+    )
+    effective_tax_rate = p2.number_input(
+        "実効税率（％）", min_value=0.0, max_value=100.0, step=1.0,
+        key=f"cat_tax_rate_{project_id}",
+    )
+    valuation_per = p3.number_input(
+        "評価PER（倍）", min_value=0.0, step=1.0, key=f"cat_valuation_per_{project_id}"
+    )
+    price_impact = catalyst_price_impact(
+        additional, incremental_margin, effective_tax_rate,
+        default_shares, valuation_per, current_price,
+    )
+    impact_value = price_impact["impact_percent"]
+    st.metric(
+        "推定株価影響",
+        "算出不可" if impact_value is None else f"+{impact_value:,.1f}％",
+        None if price_impact["price_uplift"] is None else f"+{price_impact['price_uplift']:,.0f}円",
+    )
+    with st.expander("計算式と追加売上を見る"):
+        st.write(f"追加売上：{additional:,.0f}百万円")
+        if price_impact["eps_uplift"] is not None:
+            st.write(
+                f"{additional:,.0f}百万円 × {incremental_margin:,.1f}％ × "
+                f"(1－{effective_tax_rate:,.1f}％) ÷ {default_shares:,.3f}百万株 "
+                f"＝ EPS増分 {price_impact['eps_uplift']:,.2f}円"
+            )
+            st.write(
+                f"EPS増分 {price_impact['eps_uplift']:,.2f}円 × PER {valuation_per:,.1f}倍 "
+                f"＝ 株価増分 {price_impact['price_uplift']:,.0f}円"
+            )
+        else:
+            st.info("会社概要で現在株価と株式数を入力すると株価影響を表示できます。")
     base_row, base_label = catalyst_base(pl_entries, year)
     base_sales = None if base_row is None or base_row.get("sales") in (None, "") else float(base_row["sales"])
     with st.container(border=True):
@@ -1653,7 +1755,8 @@ def catalyst_page() -> None:
                 "target_rate": target_rate, "capture_rate": capture_rate, "price_per_case": price,
                 "evidence_category": category, "source": source, "note": note, "additional_sales": additional,
                 "calculation_method": method, "base_sales": calculation_base_sales,
-                "impact_rate": impact_rate}
+                "impact_rate": impact_rate, "incremental_margin": incremental_margin,
+                "effective_tax_rate": effective_tax_rate, "valuation_per": valuation_per}
     show_warnings(catalyst_warnings(catalyst, existing_sales))
     save_only, save_and_apply = responsive_columns(2)
     if save_only.button("カタリストのみ保存", icon=":material/save:"):

@@ -34,11 +34,15 @@ def test_rate_model_catalyst_is_saved_and_reloaded(tmp_path):
         "catalyst_name": "新製品", "target_year": "2027.3",
         "calculation_method": "売上比率モデル", "base_sales": 2000,
         "impact_rate": 5, "evidence_category": "自分の仮定",
+        "incremental_margin": 20, "effective_tax_rate": 30, "valuation_per": 15,
     }, db_path)
     loaded = get_catalyst(project_id, db_path)
     assert loaded["calculation_method"] == "売上比率モデル"
     assert loaded["base_sales"] == 2000
     assert loaded["impact_rate"] == 5
+    assert loaded["incremental_margin"] == 20
+    assert loaded["effective_tax_rate"] == 30
+    assert loaded["valuation_per"] == 15
 
 
 def test_segment_entries_save_and_reload(tmp_path):

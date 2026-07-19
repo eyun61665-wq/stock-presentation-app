@@ -86,3 +86,35 @@ def test_irpocket_javascript_documents_are_loaded_as_utf8(monkeypatch, tmp_path)
     assert documents[0]["title"] == "2026年3月期 決算説明資料"
     assert documents[0]["url"] == "https://pdf.irpocket.com/C4417/test.pdf"
     assert documents[0]["quarter"] == "4"
+
+
+def test_xj_storage_documents_are_loaded_from_public_json(monkeypatch, tmp_path):
+    import data_sources
+    monkeypatch.setattr(data_sources, "CACHE_DIR", tmp_path)
+
+    class XjSession:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            if url == "https://example.test/ir/":
+                return Response(
+                    '<script src="//www.xj-storage.jp/resources/AS08899/library.js"></script>'
+                )
+            return Response(
+                '{"items":[{"title":"2025年11月期 決算短信",'
+                '"publishDate":"2026/01/13 16:00:00","categoryName":"適時開示書類",'
+                '"files":[{"type":"PDF-GENERAL","url":"https://contents.example/fy.pdf"}]}]}'
+            )
+
+    session = XjSession()
+    documents = fetch_ir_documents(
+        "https://example.test/ir/", refresh=True, session=session
+    )
+
+    assert documents[0]["title"] == "2025年11月期 決算短信"
+    assert documents[0]["url"] == "https://contents.example/fy.pdf"
+    api_call = session.calls[1]
+    assert api_call[1]["params"]["company"] == "AS08899"
+    assert api_call[1]["params"]["output"] == "json"

@@ -19,6 +19,14 @@ def test_jpx_excel_load_and_japanese_code_search(monkeypatch, tmp_path):
     assert search_master(rows, "7713")[0]["sector33"] == "精密機器"
 
 
+def test_company_name_search_ranks_exact_match_before_longer_candidate():
+    rows = [
+        {"stock_code": "1111", "company_name": "ELEMENTSホールディングス"},
+        {"stock_code": "5246", "company_name": "ELEMENTS"},
+    ]
+    assert [row["stock_code"] for row in search_master(rows, "elements")] == ["5246", "1111"]
+
+
 def test_edinet_annual_report_filter_and_code_mapping():
     docs = [{"edinetCode": "E00001", "docTypeCode": "120", "docID": "S1"},
             {"edinetCode": "E00001", "docTypeCode": "140", "docID": "S2"},

@@ -192,3 +192,34 @@ def test_company_forecast_is_not_changed_to_actual_when_imported():
         "fiscal_year": "2026.3", "result_type": "会社予想", "sales": 300,
     }])
     assert merged[0]["result_type"] == "会社予想"
+
+
+def test_single_segment_company_uses_annual_pl_as_segment(monkeypatch):
+    document = {"title": "2025年11月期 決算短信", "url": "annual.pdf"}
+    monkeypatch.setattr("financial_document_service.fetch_ir_documents", lambda *_args, **_kwargs: [document])
+    monkeypatch.setattr(
+        "financial_document_service.download_pdf",
+        lambda *_args, **_kwargs: (b"%PDF mock", {"retrieved_at": "now"}),
+    )
+    monkeypatch.setattr(
+        "financial_document_service.parse_financial_document",
+        lambda *_args, **_kwargs: {
+            "pl_records": [{
+                "fiscal_year": "2025-11-30", "result_type": "実績",
+                "sales": 3895.112, "operating_profit": -215.316,
+                "source_url": "annual.pdf",
+            }],
+            "segment_records": [], "segment_metrics": [],
+            "single_segment_name": "IoP Cloud事業", "warnings": [],
+        },
+    )
+
+    result = load_official_financials("https://example.com/ir", max_years=3)
+
+    assert result["pl_records"][0]["fiscal_year"] == "2025.11"
+    assert result["segment_records"] == [{
+        "fiscal_year": "2025.11", "result_type": "実績",
+        "segment_name": "IoP Cloud事業", "sales": 3895.112,
+        "operating_profit": -215.316, "source": "決算短信PDF（単一セグメント）",
+        "note": "annual.pdf",
+    }]

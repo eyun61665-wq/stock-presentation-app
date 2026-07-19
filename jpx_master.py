@@ -93,4 +93,15 @@ def search_master(rows: list[dict], query: str) -> list[dict]:
         code = str(row["stock_code"]).zfill(4)[:4]
         if (term.isdigit() and code == term.zfill(4)[:4]) or (not term.isdigit() and term in canonical_company_name(row["company_name"])):
             results.append({**row, "stock_code": code})
-    return results
+    if term.isdigit():
+        return results
+    # 完全一致、前方一致、短い会社名の順に並べ、近い候補を選びやすくする。
+    return sorted(
+        results,
+        key=lambda row: (
+            canonical_company_name(row["company_name"]) != term,
+            not canonical_company_name(row["company_name"]).startswith(term),
+            abs(len(canonical_company_name(row["company_name"])) - len(term)),
+            str(row["stock_code"]),
+        ),
+    )
