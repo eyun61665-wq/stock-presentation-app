@@ -22,8 +22,14 @@ class EDINETClient:
         return {"Ocp-Apim-Subscription-Key": self.api_key} if self.api_key else {}
 
     def documents(self, target_date: date) -> list[dict]:
+        params = {"date": target_date.isoformat(), "type": 2}
+        if self.api_key:
+            params["Subscription-Key"] = self.api_key
         try:
-            response = self.session.get(f"{BASE_URL}/documents.json", params={"date": target_date.isoformat(), "type": 2}, headers=self.headers, timeout=self.timeout)
+            response = self.session.get(
+                f"{BASE_URL}/documents.json", params=params,
+                headers={"User-Agent": "StockPresentationApp/1.0"}, timeout=self.timeout,
+            )
         except requests.Timeout as exc:
             raise EDINETError("EDINET API通信がタイムアウトしました。") from exc
         except requests.RequestException as exc:
@@ -35,8 +41,14 @@ class EDINETClient:
         return response.json().get("results", [])
 
     def xbrl_zip(self, doc_id: str) -> bytes:
+        params: dict[str, Any] = {"type": 1}
+        if self.api_key:
+            params["Subscription-Key"] = self.api_key
         try:
-            response = self.session.get(f"{BASE_URL}/documents/{doc_id}", params={"type": 1}, headers=self.headers, timeout=self.timeout)
+            response = self.session.get(
+                f"{BASE_URL}/documents/{doc_id}", params=params,
+                headers={"User-Agent": "StockPresentationApp/1.0"}, timeout=self.timeout,
+            )
         except requests.Timeout as exc:
             raise EDINETError("EDINET XBRL取得がタイムアウトしました。") from exc
         except requests.RequestException as exc:

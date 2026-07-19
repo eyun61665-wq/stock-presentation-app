@@ -23,6 +23,9 @@ from data_normalizer import display_code
 from jquants_client import JQuantsApiError, JQuantsClient
 from jpx_master import JPXMasterError, get_master, search_master
 from edinet_client import EDINETClient, EDINETError
+from edinet_code_master import (EDINETMasterError, find_edinet_company,
+                                load_edinet_code_master)
+from edinet_financial_service import load_edinet_financials
 from pdf_financial_extractor import extract_pdf_preview
 from pdf_financial_extractor import extract_pdf_pages
 from data_sources import DataSourceError, download_pdf, fetch_ir_pdf_links
@@ -209,6 +212,17 @@ def get_openai_financial_model() -> str:
         return "gpt-5.6-luna"
 
 
+def get_edinet_api_key() -> str | None:
+    """無料EDINETキーもソースやSQLiteへ保存しない。"""
+    key = os.getenv("EDINET_API_KEY")
+    if key:
+        return key
+    try:
+        return st.secrets.get("EDINET_API_KEY")
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def cached_company_search(api_key: str, query: str, refresh_nonce: int) -> list[dict]:
     return find_companies(JQuantsClient(api_key), query)
@@ -222,6 +236,30 @@ def cached_company_data(api_key: str, master: dict, refresh_nonce: int) -> dict:
 @st.cache_data(ttl="6h", max_entries=20, show_spinner=False)
 def cached_official_financials(ir_url: str, max_years: int, refresh_nonce: int) -> dict:
     return load_official_financials(ir_url, max_years=max_years, refresh=bool(refresh_nonce))
+
+
+@st.cache_data(ttl="7d", max_entries=20, show_spinner=False)
+def cached_edinet_financials(stock_code: str, max_years: int, refresh_nonce: int) -> dict:
+    """証券コードからEDINETコードを自動特定し、無料XBRLを取得する。"""
+    api_key = get_edinet_api_key()
+    if not api_key:
+        return {
+            "pl_records": [], "segment_records": [], "segment_metrics": [], "documents": [],
+            "warnings": ["EDINET無料キー未設定のため、決算短信PDFだけで解析しました。"],
+        }
+    rows, stale = load_edinet_code_master(refresh=bool(refresh_nonce))
+    company = find_edinet_company(rows, stock_code)
+    if company is None:
+        raise EDINETMasterError("証券コードに対応するEDINETコードを確認できませんでした。")
+    result = load_edinet_financials(
+        api_key,
+        company["edinet_code"],
+        company["fiscal_year_end"],
+        max_years=max_years,
+    )
+    if stale:
+        result.setdefault("warnings", []).append("通信失敗のため前回のEDINETコード一覧を使用しました。")
+    return result
 
 
 @st.cache_data(ttl="24h", max_entries=20, show_spinner=False)
@@ -786,6 +824,7 @@ def simple_company_data_panel(project: dict | None) -> None:
 def _uploaded_financial_result(files: list) -> dict:
     pl_by_year: dict[str, dict] = {}
     segments_by_key: dict[tuple[str, str], dict] = {}
+    metrics_by_key: dict[tuple[str, str, str], dict] = {}
     warnings: list[str] = []
     documents: list[dict[str, str]] = []
     for uploaded in files:
@@ -801,9 +840,16 @@ def _uploaded_financial_result(files: list) -> dict:
             pl_by_year[str(row["fiscal_year"])] = row
         for row in parsed["segment_records"]:
             segments_by_key[(str(row["fiscal_year"]), str(row["segment_name"]))] = row
+        for row in parsed.get("segment_metrics", []):
+            key = (
+                str(row["fiscal_year"]), str(row.get("result_type", "実績")),
+                str(row["row_label"]),
+            )
+            metrics_by_key[key] = row
     return {
         "pl_records": [pl_by_year[year] for year in sorted(pl_by_year)],
         "segment_records": [segments_by_key[key] for key in sorted(segments_by_key)],
+        "segment_metrics": [metrics_by_key[key] for key in sorted(metrics_by_key)],
         "warnings": warnings,
         "documents": documents,
     }
@@ -897,11 +943,14 @@ def financial_document_import_panel(project: dict, location: str) -> None:
         if source_url:
             source_method = (source_info or {}).get("method", "保存済み公式IR")
             heading.caption(f"取得先：{company_name or stock_code} 公式IR（{source_method}）")
-        ai_enabled = bool(get_openai_api_key())
+        ai_available = bool(get_openai_api_key())
+        heading.caption("無料解析：決算短信の文字・罫線・表レイアウトを組み合わせて抽出します。")
         heading.caption(
-            "AI補助：有効（通常解析で不足した項目だけ解析）"
-            if ai_enabled else "AI補助：未設定（OPENAI_API_KEYを設定すると利用できます）"
+            "EDINET XBRL：有効（無料）"
+            if get_edinet_api_key() else
+            "EDINET XBRL：未設定（無料キーを設定するとPL・セグメント精度が上がります）"
         )
+        use_paid_ai = False
         with heading.popover("その他", icon=":material/settings:"):
             refresh_source = st.checkbox(
                 "取得先とキャッシュを更新する",
@@ -914,6 +963,15 @@ def financial_document_import_panel(project: dict, location: str) -> None:
                 accept_multiple_files=True,
                 key=f"document_upload_{location}_{project_id}",
             )
+            if ai_available:
+                use_paid_ai = st.checkbox(
+                    "有料のOpenAI補助を使う",
+                    value=False,
+                    key=f"use_paid_ai_{location}_{project_id}",
+                    help="通常はオフのままで無料です。オンにした取得だけAPI料金が発生します。",
+                )
+            else:
+                st.caption("有料AIは未設定です。無料解析だけで動作します。")
         fetch_clicked = action.button(
             f"{target_label}情報を取得",
             type="primary",
@@ -929,6 +987,13 @@ def financial_document_import_panel(project: dict, location: str) -> None:
                     source_info = cached_ir_source(stock_code, company_name, saved_url, nonce)
                     st.session_state[source_key] = source_info
                     result = cached_official_financials(source_info["url"], 5, nonce)
+                    if get_edinet_api_key():
+                        try:
+                            edinet_result = cached_edinet_financials(stock_code, 5, nonce)
+                            # 標準化されたXBRLを基準にし、短信PDFで詳細行・KPIを補う。
+                            result = merge_financial_previews(edinet_result, result)
+                        except (EDINETError, EDINETMasterError, ValueError, OSError) as edinet_exc:
+                            result.setdefault("warnings", []).append(f"EDINET補完を完了できませんでした：{edinet_exc}")
                     if get_jquants_api_key():
                         try:
                             result = merge_financial_previews(
@@ -944,7 +1009,7 @@ def financial_document_import_panel(project: dict, location: str) -> None:
                             result,
                             jquants_financial_fallback(stock_code, nonce),
                         )
-                    if ai_enabled and _financial_result_needs_ai(result, location):
+                    if use_paid_ai and _financial_result_needs_ai(result, location):
                         try:
                             ai_result = cached_ai_official_financials(
                                 source_info["url"], get_openai_financial_model(), 5, nonce,
@@ -968,6 +1033,16 @@ def financial_document_import_panel(project: dict, location: str) -> None:
                     st.warning(f"{target_label}を資料から抽出できませんでした。下の表へ手入力できます。")
             except (IRSourceDiscoveryError, DataSourceError, ValueError, OSError) as exc:
                 try:
+                    if get_edinet_api_key():
+                        with st.spinner("無料のEDINET XBRLへ切り替えています…"):
+                            result = cached_edinet_financials(
+                                stock_code, 5, time.time_ns() if refresh_source else 0,
+                            )
+                        count = _apply_financial_result(project_id, result, location)
+                        if count:
+                            st.session_state[preview_key] = result
+                            st.session_state[notice_key] = f"EDINETから{target_label}を取得し、下の表へ反映しました。"
+                            st.rerun()
                     if location != "pl":
                         raise ValueError("公式IRからセグメントを取得できませんでした。")
                     with st.spinner("J-QuantsのPLへ切り替えています…"):
@@ -978,14 +1053,14 @@ def financial_document_import_panel(project: dict, location: str) -> None:
                         st.session_state[notice_key] = f"J-QuantsからPLを{count}年度取得し、下の表へ反映しました。"
                         st.rerun()
                     st.warning("公式IRとJ-QuantsのどちらからもPLを取得できませんでした。")
-                except (DataSourceError, JQuantsApiError, ValueError) as fallback_exc:
+                except (DataSourceError, JQuantsApiError, EDINETError, EDINETMasterError, ValueError, OSError) as fallback_exc:
                     st.error(f"自動取得できませんでした：{fallback_exc}")
 
         upload_signature = tuple((item.name, item.size) for item in uploaded)
         if uploaded and upload_signature != st.session_state.get(upload_signature_key):
             with st.spinner("アップロードしたPDFを解析しています…"):
                 result = _uploaded_financial_result(uploaded)
-                if ai_enabled and _financial_result_needs_ai(result, location):
+                if use_paid_ai and _financial_result_needs_ai(result, location):
                     try:
                         result = merge_financial_previews(
                             result,
@@ -1011,7 +1086,7 @@ def financial_document_import_panel(project: dict, location: str) -> None:
                 st.caption(f"・{warning}")
         if preview and preview.get("documents"):
             st.caption("出典：" + " ｜ ".join(row["title"] for row in preview["documents"]))
-        st.caption("AIを使う場合も、資料にない項目は空欄のままです。AI抽出値は出典ページと照合してください。")
+        st.caption("無料解析でも資料にない項目は推測せず空欄にします。出典資料とページを確認してください。")
 
 
 def project_page() -> None:

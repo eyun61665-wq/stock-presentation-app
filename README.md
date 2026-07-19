@@ -65,8 +65,8 @@ JQUANTS_API_KEY = "発行したAPIキー"
 ## 無料公開データ（標準）
 
 - JPXの東証上場銘柄一覧を標準の企業マスターとして使用します。初回取得後は `data_cache/` に保存し、7日間は再利用します。「JPX企業マスター更新」で明示的に更新できます。通信に失敗した場合は前回キャッシュを使い、キャッシュがない場合でも手入力は利用できます。
-- EDINET API Version 2は有価証券報告書のXBRL取得に使用できます。EDINET APIキーが必要な場合のみ、`EDINET_API_KEY` を環境変数または `.streamlit/secrets.toml` に設定してください。キーは保存されません。
-- 企業公式IRページの本決算短信をローカルキャッシュへ保存し、連結損益計算書とセグメント注記を解析します。取得結果は確認なしに保存されません。
+- EDINET API Version 2は有価証券報告書のXBRL取得に使用できます。EDINETの無料利用登録で発行したキーを、`EDINET_API_KEY` として環境変数または `.streamlit/secrets.toml` に設定してください。キーは保存されません。
+- 企業公式IRページの本決算短信をローカルキャッシュへ保存し、`pypdf` と `pdfplumber` で文字・罫線・表の配置を解析します。連結PL、報告セグメント、会社固有KPIのうち資料で確認できた数値だけを反映します。
 
 ```toml
 EDINET_API_KEY = "発行したAPIキー"
@@ -89,7 +89,7 @@ PDFはローカルにキャッシュされ、同じURLは「その他」のキ�
 
 ## OpenAIによるPDF補助解析（任意）
 
-通常のPython解析でPLの詳細行やセグメントを取得できなかった場合だけ、OpenAI Responses APIへ公開決算PDFを送り、構造化データとして補助抽出できます。APIキーがなくてもアプリの通常解析、J-Quants、手入力は利用できます。
+通常のPython解析でPLの詳細行やセグメントを取得できなかった場合だけ、OpenAI Responses APIへ公開決算PDFを送り、構造化データとして補助抽出できます。これは完全な任意機能で、初期状態ではオフです。無料で使う場合は設定不要で、公式PDF解析、EDINET XBRL、J-Quants、手入力を利用できます。
 
 ローカルでは環境変数、公開版ではStreamlit Community CloudのSecretsへ次を設定してください。APIキーはソースコードやSQLiteへ保存されません。
 
@@ -99,7 +99,7 @@ OPENAI_API_KEY = "発行したOpenAI APIキー"
 OPENAI_FINANCIAL_MODEL = "gpt-5.6-luna"
 ```
 
-処理順は「通常のPDF表解析 → J-Quants等の構造化データ → 不足項目だけAI解析」です。AIには推測禁止、連結優先、通期累計、出典ページ必須を指示し、返却形式をJSON Schemaで制限しています。それでも誤抽出の可能性はあるため、画面に表示される資料名・ページ番号と原文を照合してください。OpenAI APIの利用料金はAPIアカウント側に発生します。
+処理順は「無料のPDF表解析 → EDINET XBRL/J-Quants等の構造化データ」です。画面の「その他」で「有料のOpenAI補助を使う」を明示的にオンにした取得だけAIを使います。AIには推測禁止、連結優先、通期累計、出典ページ必須を指示し、返却形式をJSON Schemaで制限しています。それでも誤抽出の可能性はあるため、画面に表示される資料名・ページ番号と原文を照合してください。OpenAI APIをオンにした場合だけAPI料金が発生します。
 
 - [OpenAI API quickstart](https://developers.openai.com/api/docs/quickstart)
 - [OpenAI API file inputs](https://developers.openai.com/api/docs/guides/file-inputs)

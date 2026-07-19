@@ -6,6 +6,7 @@ from typing import Any
 
 from data_sources import DataSourceError, download_pdf, fetch_ir_documents
 from financial_parser import parse_detailed_pl, parse_segment_statements
+from free_financial_parser import extract_pdf_layout, parse_layout_tables
 from pdf_financial_extractor import extract_pdf_pages
 from ai_financial_parser import AIFinancialParserError, OpenAIFinancialParser
 
@@ -52,14 +53,64 @@ def parse_financial_document(
     source_url: str,
     retrieved_at: str,
 ) -> dict[str, list[dict[str, Any]]]:
-    pages = extract_pdf_pages(content)
+    pages = extract_pdf_pages(content, max_pages=60)
+    layouts = extract_pdf_layout(content, max_pages=60)
     if not pages or not any(page.strip() for page in pages):
-        return {"pl_records": [], "segment_records": [], "warnings": [f"{source_name}は画像PDFまたは文字抽出できないPDFです。"]}
-    return {
+        return {"pl_records": [], "segment_records": [], "segment_metrics": [], "warnings": [f"{source_name}は画像PDFまたは文字抽出できないPDFです。"]}
+    standard = {
         "pl_records": parse_detailed_pl(pages, source_name, source_url, retrieved_at),
         "segment_records": parse_segment_statements(pages, source_name, source_url, retrieved_at),
+        "segment_metrics": [],
         "warnings": [],
     }
+    layout_result = parse_layout_tables(layouts, source_name, source_url, retrieved_at)
+    return _merge_free_results(standard, layout_result)
+
+
+def _merge_free_results(primary: dict[str, Any], supplement: dict[str, Any]) -> dict[str, Any]:
+    """従来解析を優先し、表レイアウト解析で空欄と未取得行を補う。"""
+    result = dict(primary)
+
+    def period_key(value: Any) -> str:
+        text = str(value or "")
+        match = re.search(r"(20\d{2})[^0-9]+(\d{1,2})", text)
+        return f"{int(match.group(1)):04d}.{int(match.group(2))}" if match else text
+
+    pl_by_key = {
+        (period_key(row.get("fiscal_year")), str(row.get("result_type", "実績"))): dict(row)
+        for row in primary.get("pl_records", [])
+    }
+    for row in supplement.get("pl_records", []):
+        key = (period_key(row.get("fiscal_year")), str(row.get("result_type", "実績")))
+        current = pl_by_key.get(key, {})
+        for field, value in row.items():
+            if current.get(field) in (None, "") and value not in (None, ""):
+                current[field] = value
+        pl_by_key[key] = current
+    result["pl_records"] = [pl_by_key[key] for key in sorted(pl_by_key)]
+
+    segment_by_key = {
+        (period_key(row.get("fiscal_year")), str(row.get("result_type", "実績")), str(row.get("segment_name"))): dict(row)
+        for row in primary.get("segment_records", [])
+    }
+    for row in supplement.get("segment_records", []):
+        key = (period_key(row.get("fiscal_year")), str(row.get("result_type", "実績")), str(row.get("segment_name")))
+        current = segment_by_key.get(key, {})
+        for field, value in row.items():
+            if current.get(field) in (None, "") and value not in (None, ""):
+                current[field] = value
+        segment_by_key[key] = current
+    result["segment_records"] = [segment_by_key[key] for key in sorted(segment_by_key)]
+
+    metric_by_key = {
+        (period_key(row.get("fiscal_year")), str(row.get("result_type", "実績")), str(row.get("row_label"))): dict(row)
+        for row in primary.get("segment_metrics", [])
+    }
+    for row in supplement.get("segment_metrics", []):
+        key = (period_key(row.get("fiscal_year")), str(row.get("result_type", "実績")), str(row.get("row_label")))
+        metric_by_key.setdefault(key, dict(row))
+    result["segment_metrics"] = [metric_by_key[key] for key in sorted(metric_by_key)]
+    return result
 
 
 def load_official_financials(
@@ -70,10 +121,11 @@ def load_official_financials(
     """公式IR一覧から必要な年数が集まるまで本決算短信を解析する。"""
     documents = select_annual_documents(fetch_ir_documents(ir_url, refresh=refresh), max_documents=max_years + 2)
     if not documents:
-        return {"pl_records": [], "segment_records": [], "documents": [], "warnings": ["本決算短信を見つけられませんでした。"]}
+        return {"pl_records": [], "segment_records": [], "segment_metrics": [], "documents": [], "warnings": ["本決算短信を見つけられませんでした。"]}
 
     pl_by_year: dict[str, dict[str, Any]] = {}
     segments_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    metrics_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
     used_documents: list[dict[str, str]] = []
     warnings: list[str] = []
     for document in documents:
@@ -92,7 +144,7 @@ def load_official_financials(
             document["url"],
             metadata["retrieved_at"],
         )
-        if parsed["pl_records"] or parsed["segment_records"]:
+        if parsed["pl_records"] or parsed["segment_records"] or parsed.get("segment_metrics"):
             used_documents.append(document)
         warnings.extend(parsed["warnings"])
         # IRページは新しい順。後から古い短信を読んでも同年度を上書きしない。
@@ -101,6 +153,12 @@ def load_official_financials(
         for row in parsed["segment_records"]:
             key = (str(row["fiscal_year"]), str(row["segment_name"]))
             segments_by_key.setdefault(key, row)
+        for row in parsed.get("segment_metrics", []):
+            key = (
+                str(row["fiscal_year"]), str(row.get("result_type", "実績")),
+                str(row["row_label"]),
+            )
+            metrics_by_key.setdefault(key, row)
         if len(pl_by_year) >= max_years:
             break
 
@@ -113,6 +171,10 @@ def load_official_financials(
     return {
         "pl_records": pl_records,
         "segment_records": segment_records,
+        "segment_metrics": [
+            metrics_by_key[key] for key in sorted(metrics_by_key)
+            if not selected_years or key[0] in selected_years
+        ],
         "documents": used_documents,
         "warnings": warnings,
     }
