@@ -99,10 +99,10 @@ PDFはローカルにキャッシュされ、同じURLは「その他」のキ�
 ```toml
 GEMINI_API_KEY = "Google AI Studioで発行したAPIキー"
 # 任意。無料枠対象モデルを指定します。
-GEMINI_FINANCIAL_MODEL = "gemini-2.5-flash"
+GEMINI_FINANCIAL_MODEL = "gemini-3.5-flash"
 ```
 
-処理順は「無料のPDF表解析 → EDINET XBRL/J-Quants → 不足項目だけGemini」です。同じ資料のGemini結果は24時間キャッシュします。無料枠の上限に達した場合は追加課金へ勝手に切り替えず、従来解析と手入力へ戻ります。返却値には推測禁止、連結優先、通期累計、出典ページ必須を指示していますが、必ず原文と照合してください。
+処理順は「無料のPDF表解析 → EDINET XBRL/J-Quants → 不足項目だけGemini」です。同じ資料のGemini結果は24時間キャッシュします。指定モデルが利用できない場合は、無料枠対応のFlashモデルへ自動で切り替えます。無料枠の上限に達した場合は追加課金へ勝手に切り替えず、従来解析と手入力へ戻ります。返却値には推測禁止、連結優先、通期累計、出典ページ必須を指示していますが、必ず原文と照合してください。
 
 - [Gemini APIキー](https://ai.google.dev/gemini-api/docs/api-key)
 - [GeminiのPDF解析](https://ai.google.dev/gemini-api/docs/document-processing)

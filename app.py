@@ -237,9 +237,9 @@ def get_gemini_financial_model() -> str:
     if model:
         return model
     try:
-        return str(st.secrets.get("GEMINI_FINANCIAL_MODEL", "gemini-2.5-flash"))
+        return str(st.secrets.get("GEMINI_FINANCIAL_MODEL", "gemini-3.5-flash"))
     except Exception:
-        return "gemini-2.5-flash"
+        return "gemini-3.5-flash"
 
 
 def get_edinet_api_key() -> str | None:

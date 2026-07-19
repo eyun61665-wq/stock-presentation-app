@@ -10,6 +10,10 @@ import requests
 from ai_financial_parser import FINANCIAL_SCHEMA, PROMPT, normalize_ai_result
 
 
+DEFAULT_MODEL = "gemini-3.5-flash"
+FALLBACK_MODELS = ("gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-2.5-flash")
+
+
 class GeminiFinancialParserError(RuntimeError):
     """Gemini解析を継続できない場合の日本語表示用例外。"""
 
@@ -26,14 +30,14 @@ class GeminiFinancialParser:
     def __init__(
         self,
         api_key: str,
-        model: str = "gemini-2.5-flash",
+        model: str = DEFAULT_MODEL,
         session: requests.Session | None = None,
         timeout: float = 180.0,
     ) -> None:
         if not api_key.strip():
             raise GeminiFinancialParserError("GEMINI_API_KEYが設定されていません。")
         self.api_key = api_key.strip()
-        self.model = model.strip() or "gemini-2.5-flash"
+        self.model = model.strip() or DEFAULT_MODEL
         self.session = session or requests.Session()
         self.timeout = timeout
 
@@ -57,23 +61,34 @@ class GeminiFinancialParser:
                 "temperature": 0,
             },
         }
-        try:
-            response = self.session.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent",
-                headers={"x-goog-api-key": self.api_key, "Content-Type": "application/json"},
-                json=request_body,
-                timeout=(10, self.timeout),
-            )
-        except requests.Timeout as exc:
-            raise GeminiFinancialParserError("Gemini解析がタイムアウトしました。") from exc
-        except requests.RequestException as exc:
-            raise GeminiFinancialParserError("Gemini解析の通信に失敗しました。") from exc
+        models = tuple(dict.fromkeys((self.model, *FALLBACK_MODELS)))
+        response = None
+        used_model = self.model
+        for candidate_model in models:
+            try:
+                response = self.session.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{candidate_model}:generateContent",
+                    headers={"x-goog-api-key": self.api_key, "Content-Type": "application/json"},
+                    json=request_body,
+                    timeout=(10, self.timeout),
+                )
+            except requests.Timeout as exc:
+                raise GeminiFinancialParserError("Gemini解析がタイムアウトしました。") from exc
+            except requests.RequestException as exc:
+                raise GeminiFinancialParserError("Gemini解析の通信に失敗しました。") from exc
+            used_model = candidate_model
+            if response.status_code != 404:
+                break
+        if response is None:
+            raise GeminiFinancialParserError("Gemini解析を開始できませんでした。")
         if response.status_code in (401, 403):
             raise GeminiFinancialParserError("Gemini APIキーまたは利用地域の設定を確認してください。")
         if response.status_code == 429:
             raise GeminiFinancialParserError("Gemini無料枠の利用上限に達しました。時間をおいて再実行してください。")
         if not response.ok:
-            raise GeminiFinancialParserError(f"Gemini解析に失敗しました（HTTP {response.status_code}）。")
+            raise GeminiFinancialParserError(
+                f"Gemini解析に失敗しました（モデル：{used_model}、HTTP {response.status_code}）。"
+            )
         try:
             structured = json.loads(_response_text(response.json()))
         except (ValueError, TypeError, json.JSONDecodeError) as exc:

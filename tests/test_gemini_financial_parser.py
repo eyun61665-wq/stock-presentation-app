@@ -25,6 +25,16 @@ class FakeSession:
         return self.response
 
 
+class SequenceSession:
+    def __init__(self, responses):
+        self.responses = iter(responses)
+        self.urls = []
+
+    def post(self, url, **kwargs):
+        self.urls.append(url)
+        return next(self.responses)
+
+
 def test_gemini_pdf_request_uses_api_key_pdf_and_structured_output():
     structured = {
         "pl_records": [],
@@ -64,3 +74,17 @@ def test_gemini_free_limit_error_is_japanese():
 def test_gemini_missing_key_does_not_start_parser():
     with pytest.raises(GeminiFinancialParserError, match="GEMINI_API_KEY"):
         GeminiFinancialParser("")
+
+
+def test_gemini_retries_a_current_free_model_when_configured_model_is_missing():
+    structured = {"pl_records": [], "segment_records": [], "segment_metrics": [], "warnings": []}
+    session = SequenceSession([
+        FakeResponse(404, {"error": {"message": "model not found"}}),
+        FakeResponse(200, {"candidates": [{"content": {"parts": [{"text": json.dumps(structured)}]}}]}),
+    ])
+    parser = GeminiFinancialParser("key", model="old-model", session=session)
+
+    parser.parse_pdf(b"%PDF-1.7 sample", "決算短信.pdf")
+
+    assert session.urls[0].endswith("/models/old-model:generateContent")
+    assert session.urls[1].endswith("/models/gemini-3.5-flash:generateContent")
