@@ -45,6 +45,22 @@ PDF抽出結果は、確認なしにSQLiteへ保存されません。画像だ�
 
 自動取得できない項目は「取得できませんでした」と表示し、手入力を続けられます。
 
+## 財務データアダプター
+
+企業名やXBRLタグを特定企業向けに固定せず、取得・解析・正規化を次のインターフェースで分離しています。
+
+- `CompanyMasterProvider`：JPX等の企業マスター
+- `MarketDataProvider`：株価・バリュエーション
+- `EdinetDocumentProvider`：EDINET書類一覧・原本
+- `XbrlFinancialParser`：XBRL財務・セグメント候補
+- `PdfCandidateExtractor`：PDFの確定前候補
+- `FinancialMetricNormalizer`：共通財務キーへの変換
+- `SegmentNormalizer`：確認済みセグメント名への変換
+
+共通財務キーは`revenue`、`cost_of_sales`、`gross_profit`、`sga`、`operating_income`、`ordinary_income`、`net_income`、`eps`です。元表記、元XBRLタグ、書類、単位、年度を保持し、変換できない項目は未確定候補として保存します。
+
+マッピングは企業固有、会計基準別、全企業共通の順に適用します。EDINET APIの本格接続は後から`EdinetDocumentProvider`を差し替えて追加できます。銀行・証券・保険・REITは現在の標準PLへ無理に変換しません。
+
 ## バックアップとマイグレーション
 
 DB変更前のファイルは `backup/<日時>/` へ保存します。マイグレーションは列・テーブルの追加を基本とし、旧テーブルを削除しません。古い予想テーブルの構造変更が必要な場合も、旧表を `*_legacy_<日時>` としてDB内に残してからコピーします。
@@ -69,6 +85,9 @@ OneDriveの一時フォルダで権限エラーになる環境では、次のよ
 - `kpi_engine.py`：KPIシナリオ、売上、寄与、PL反映
 - `market_data.py`：yfinance取得
 - `pdf_extractor.py`：PDFテキストと候補抽出
+- `data_providers.py`：企業・市場・書類・解析アダプター
+- `financial_data_models.py`：根拠情報を保持する共通モデル
+- `financial_normalizer.py`：財務項目・セグメントの安全な正規化
 - `exporter.py`：CSV、Excel、タブ区切り出力
 - `legacy_app.py`：旧画面コードの保管
 

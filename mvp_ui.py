@@ -9,6 +9,7 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
+from data_providers import YFinanceMarketDataProvider
 from database import (
     DEFAULT_DB_PATH,
     delete_project,
@@ -27,6 +28,7 @@ from database import (
     save_segment_entries,
 )
 from exporter import frame_to_csv, frame_to_excel, frame_to_tsv
+from financial_data_models import standard_pl_support
 from kpi_engine import (
     INPUT_AMOUNT,
     INPUT_DIRECT,
@@ -39,7 +41,7 @@ from kpi_engine import (
     parse_number,
     segment_reconciliation,
 )
-from market_data import MarketDataError, fetch_market_data
+from market_data import MarketDataError
 from pdf_extractor import (
     PDFExtractionError,
     PL_KEYWORDS,
@@ -226,6 +228,7 @@ def _line_chart(frame: pd.DataFrame, x: str, series: list[str], value_title: str
         return
     long = frame.melt(id_vars=[x], value_vars=series, var_name="系列", value_name="値")
     long["値"] = pd.to_numeric(long["値"], errors="coerce")
+    long["値"] = long["値"].replace([float("inf"), float("-inf")], pd.NA)
     long = long.dropna(subset=[x, "値"])
     if long.empty:
         st.caption("グラフに表示できる数値がありません。")
@@ -246,6 +249,7 @@ def _bar_chart(frame: pd.DataFrame, x: str, y: str) -> None:
         st.caption("グラフに表示できる数値がありません。")
         return
     clean[y] = pd.to_numeric(clean[y], errors="coerce")
+    clean[y] = clean[y].replace([float("inf"), float("-inf")], pd.NA)
     clean = clean.dropna(subset=[x, y])
     if clean.empty:
         st.caption("グラフに表示できる数値がありません。")
@@ -255,7 +259,7 @@ def _bar_chart(frame: pd.DataFrame, x: str, y: str) -> None:
 
 @st.cache_data(show_spinner=False, ttl=900, max_entries=20)
 def _cached_yfinance(code: str) -> dict[str, Any]:
-    return fetch_market_data(code)
+    return YFinanceMarketDataProvider().fetch(code)
 
 
 @st.cache_data(show_spinner=False, ttl=3600, max_entries=20)
@@ -380,6 +384,17 @@ def _overview_tab(project: dict, data: dict, edit_mode: bool) -> None:
 def _pl_tab(project: dict, data: dict, edit_mode: bool) -> None:
     st.subheader("PL")
     project_id = project["id"]
+    industry = (
+        data.get("overview", {}).get("industry")
+        or project.get("sector33")
+        or project.get("sector17")
+        or ""
+    )
+    supported, reason = standard_pl_support(industry)
+    if not supported:
+        st.warning(reason, icon=":material/warning:")
+        st.caption("誤った共通PLへ変換しないため、業種別の財務モデルを追加するまで候補値を確定しません。")
+        return
     entries = get_pl_entries(project_id)
     settings = dict(data["settings"])
     draft_key = f"mvp_pl_draft_{project_id}"

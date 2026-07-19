@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import shutil
 import sqlite3
 from datetime import datetime
@@ -9,7 +10,14 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = BASE_DIR / "stock_projects.db"
-SCHEMA_VERSION = "12"
+SCHEMA_VERSION = "13"
+FINANCIAL_DATA_TABLES = {
+    "company_master_records",
+    "source_documents",
+    "financial_facts",
+    "segment_facts",
+    "mapping_rules",
+}
 API_PROJECT_COLUMNS = {
     "company_name_en": "TEXT DEFAULT ''", "market": "TEXT DEFAULT ''", "sector17": "TEXT DEFAULT ''",
     "sector33": "TEXT DEFAULT ''", "price_date": "TEXT DEFAULT ''", "data_retrieved_at": "TEXT DEFAULT ''",
@@ -134,6 +142,7 @@ def initialize_database(db_path: str | Path = DEFAULT_DB_PATH) -> None:
     needs_forecast_schema = False
     needs_segment_metrics_table = False
     needs_mvp_table = False
+    needs_financial_data_tables = False
     schema_outdated = False
     if path.exists():
         with get_connection(path) as conn:
@@ -160,8 +169,11 @@ def initialize_database(db_path: str | Path = DEFAULT_DB_PATH) -> None:
                     needs_table_columns = needs_table_columns or bool(set(columns) - existing)
             needs_segment_metrics_table = not _table_exists(conn, "segment_metrics")
             needs_mvp_table = not _table_exists(conn, "project_mvp_data")
+            needs_financial_data_tables = any(
+                not _table_exists(conn, table) for table in FINANCIAL_DATA_TABLES
+            )
         if (legacy or schema_outdated or needs_api_columns or needs_table_columns or needs_forecast_schema
-                or needs_segment_metrics_table or needs_mvp_table):
+                or needs_segment_metrics_table or needs_mvp_table or needs_financial_data_tables):
             _backup_database(path)
 
     with get_connection(path) as conn:
@@ -238,6 +250,55 @@ def initialize_database(db_path: str | Path = DEFAULT_DB_PATH) -> None:
                 updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS company_master_records (
+                project_id INTEGER PRIMARY KEY, stock_code TEXT NOT NULL DEFAULT '',
+                company_name TEXT NOT NULL DEFAULT '', market TEXT DEFAULT '', industry TEXT DEFAULT '',
+                accounting_standard TEXT DEFAULT '', provider TEXT DEFAULT '手入力',
+                raw_json TEXT NOT NULL DEFAULT '{}', confirmed_at TEXT DEFAULT '',
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS source_documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL,
+                provider TEXT NOT NULL, document_id TEXT NOT NULL, document_type TEXT NOT NULL,
+                title TEXT DEFAULT '', source_url TEXT DEFAULT '', filing_date TEXT DEFAULT '',
+                fiscal_year TEXT DEFAULT '', retrieved_at TEXT DEFAULT '', metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                UNIQUE(project_id, provider, document_id)
+            );
+            CREATE TABLE IF NOT EXISTS financial_facts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL,
+                source_key TEXT NOT NULL, document_row_id INTEGER, common_key TEXT,
+                raw_label TEXT NOT NULL DEFAULT '', xbrl_tag TEXT DEFAULT '', value REAL,
+                unit TEXT DEFAULT '', fiscal_year TEXT DEFAULT '', accounting_standard TEXT DEFAULT '',
+                source TEXT DEFAULT '', manual_value REAL, mapping_scope TEXT DEFAULT 'unresolved',
+                status TEXT DEFAULT 'candidate', confirmed_at TEXT DEFAULT '',
+                metadata_json TEXT NOT NULL DEFAULT '{}', updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                FOREIGN KEY(document_row_id) REFERENCES source_documents(id) ON DELETE SET NULL,
+                UNIQUE(project_id, source_key)
+            );
+            CREATE TABLE IF NOT EXISTS segment_facts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL,
+                source_key TEXT NOT NULL, document_row_id INTEGER, segment_name TEXT,
+                raw_label TEXT NOT NULL DEFAULT '', xbrl_tag TEXT DEFAULT '', metric TEXT DEFAULT 'revenue',
+                value REAL, unit TEXT DEFAULT '', fiscal_year TEXT DEFAULT '', source TEXT DEFAULT '',
+                manual_value REAL, display_order INTEGER DEFAULT 0, status TEXT DEFAULT 'candidate',
+                confirmed_at TEXT DEFAULT '', metadata_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                FOREIGN KEY(document_row_id) REFERENCES source_documents(id) ON DELETE SET NULL,
+                UNIQUE(project_id, source_key)
+            );
+            CREATE TABLE IF NOT EXISTS mapping_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, scope_key TEXT NOT NULL UNIQUE,
+                scope_type TEXT NOT NULL, project_id INTEGER,
+                accounting_standard TEXT DEFAULT '', raw_identifier TEXT NOT NULL,
+                common_key TEXT NOT NULL, note TEXT DEFAULT '', confirmed_at TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+            );
         """)
         if legacy:
             _migrate_legacy_units(conn)
@@ -252,6 +313,12 @@ def initialize_database(db_path: str | Path = DEFAULT_DB_PATH) -> None:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
         if needs_forecast_schema:
             _migrate_forecast_tables(conn)
+        company_master_migrated = _migrate_existing_company_master(conn)
+        if company_master_migrated:
+            conn.execute(
+                "INSERT OR REPLACE INTO app_metadata (key, value) VALUES ('company_master_migration_count', ?)",
+                (str(company_master_migrated),),
+            )
         migration_report = _migrate_legacy_project_data_in_connection(conn)
         if migration_report["projects_created"] or migration_report["fields_filled"]:
             conn.execute(
@@ -267,6 +334,29 @@ def _decode_json_object(value: object) -> dict:
     except (json.JSONDecodeError, TypeError):
         return {}
     return loaded if isinstance(loaded, dict) else {}
+
+
+def _migrate_existing_company_master(conn: sqlite3.Connection) -> int:
+    """既存projectsを汎用企業マスターへ一度だけ補完する。既存レコードは上書きしない。"""
+    if not _table_exists(conn, "projects") or not _table_exists(conn, "company_master_records"):
+        return 0
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(projects)")}
+
+    def text_column(name: str, fallback: str = "''") -> str:
+        return f"COALESCE({name}, '')" if name in columns else fallback
+
+    company_name = text_column("company_name", text_column("project_name"))
+    before = conn.execute("SELECT COUNT(*) FROM company_master_records").fetchone()[0]
+    conn.execute(
+        f"""INSERT OR IGNORE INTO company_master_records
+           (project_id, stock_code, company_name, market, industry, accounting_standard,
+            provider, raw_json, confirmed_at, updated_at)
+           SELECT id, {text_column('stock_code')}, {company_name}, {text_column('market')},
+                  {text_column('sector33')}, '', '既存projects', '{{}}', '', CURRENT_TIMESTAMP
+           FROM projects"""
+    )
+    after = conn.execute("SELECT COUNT(*) FROM company_master_records").fetchone()[0]
+    return int(after - before)
 
 
 def _migrate_legacy_project_data_in_connection(conn: sqlite3.Connection) -> dict[str, object]:
@@ -775,3 +865,354 @@ def save_segment_metrics(project_id: int, entries: list[dict], db_path: str | Pa
                 row.get("source", row.get("出典")) or "手入力",
                 row.get("note", row.get("メモ")) or "",
             ) for row in entries])
+
+
+def _plain_dict(value: object) -> dict:
+    if isinstance(value, dict):
+        return dict(value)
+    converter = getattr(value, "to_dict", None)
+    if callable(converter):
+        converted = converter()
+        return dict(converted) if isinstance(converted, dict) else {}
+    return {}
+
+
+def _source_key(kind: str, row: dict) -> str:
+    """同じ取得候補を何度保存しても重複させない安定キー。"""
+    identity = {
+        "kind": kind,
+        "document_id": row.get("document_id") or "",
+        "raw_label": row.get("raw_label") or "",
+        "xbrl_tag": row.get("xbrl_tag") or "",
+        "fiscal_year": row.get("fiscal_year") or "",
+        "metric": row.get("metric") or "",
+        "unit": row.get("unit") or "",
+    }
+    encoded = json.dumps(identity, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def save_company_master_record(record: object, db_path: str | Path = DEFAULT_DB_PATH) -> None:
+    """取得した企業マスターをプロジェクト単位で保存し、空値では既存値を消さない。"""
+    row = _plain_dict(record)
+    project_id = int(row["project_id"])
+    with get_connection(db_path) as conn:
+        existing = conn.execute(
+            "SELECT * FROM company_master_records WHERE project_id=?", (project_id,)
+        ).fetchone()
+        current = dict(existing) if existing else {}
+        fields = (
+            "stock_code", "company_name", "market", "industry", "accounting_standard",
+            "provider", "confirmed_at",
+        )
+        merged = {field: current.get(field, "") for field in fields}
+        for field in fields:
+            if not _is_blank(row.get(field)):
+                merged[field] = row[field]
+        raw_data = row.get("raw_data") if isinstance(row.get("raw_data"), dict) else {}
+        if not raw_data and existing:
+            raw_data = _decode_json_object(existing["raw_json"])
+        conn.execute(
+            """INSERT INTO company_master_records
+               (project_id, stock_code, company_name, market, industry, accounting_standard,
+                provider, raw_json, confirmed_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+               ON CONFLICT(project_id) DO UPDATE SET
+                 stock_code=excluded.stock_code, company_name=excluded.company_name,
+                 market=excluded.market, industry=excluded.industry,
+                 accounting_standard=excluded.accounting_standard, provider=excluded.provider,
+                 raw_json=excluded.raw_json, confirmed_at=excluded.confirmed_at,
+                 updated_at=CURRENT_TIMESTAMP""",
+            (
+                project_id, merged["stock_code"], merged["company_name"], merged["market"],
+                merged["industry"], merged["accounting_standard"], merged["provider"] or "手入力",
+                json.dumps(raw_data, ensure_ascii=False), merged["confirmed_at"],
+            ),
+        )
+        project = conn.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+        if project:
+            updates = {}
+            if _is_blank(project["stock_code"]) and merged["stock_code"]:
+                updates["stock_code"] = merged["stock_code"]
+            if _is_blank(project["company_name"]) and merged["company_name"]:
+                updates["company_name"] = merged["company_name"]
+            if "market" in project.keys() and _is_blank(project["market"]) and merged["market"]:
+                updates["market"] = merged["market"]
+            if "sector33" in project.keys() and _is_blank(project["sector33"]) and merged["industry"]:
+                updates["sector33"] = merged["industry"]
+            if updates:
+                conn.execute(
+                    f"UPDATE projects SET {', '.join(f'{key}=?' for key in updates)}, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    [*updates.values(), project_id],
+                )
+
+
+def get_company_master_record(project_id: int, db_path: str | Path = DEFAULT_DB_PATH) -> dict | None:
+    with get_connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM company_master_records WHERE project_id=?", (project_id,)
+        ).fetchone()
+    if not row:
+        return None
+    result = dict(row)
+    result["raw_data"] = _decode_json_object(result.pop("raw_json", "{}"))
+    return result
+
+
+def save_source_document(document: object, db_path: str | Path = DEFAULT_DB_PATH) -> int:
+    row = _plain_dict(document)
+    if not str(row.get("document_id") or "").strip():
+        raise ValueError("取得書類のdocument_idが必要です。")
+    metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """INSERT INTO source_documents
+               (project_id, provider, document_id, document_type, title, source_url,
+                filing_date, fiscal_year, retrieved_at, metadata_json, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+               ON CONFLICT(project_id, provider, document_id) DO UPDATE SET
+                 document_type=excluded.document_type, title=excluded.title,
+                 source_url=excluded.source_url, filing_date=excluded.filing_date,
+                 fiscal_year=excluded.fiscal_year, retrieved_at=excluded.retrieved_at,
+                 metadata_json=excluded.metadata_json, updated_at=CURRENT_TIMESTAMP""",
+            (
+                int(row["project_id"]), str(row.get("provider") or ""), str(row["document_id"]),
+                str(row.get("document_type") or ""), str(row.get("title") or ""),
+                str(row.get("source_url") or ""), str(row.get("filing_date") or ""),
+                str(row.get("fiscal_year") or ""), str(row.get("retrieved_at") or ""),
+                json.dumps(metadata, ensure_ascii=False),
+            ),
+        )
+        saved = conn.execute(
+            "SELECT id FROM source_documents WHERE project_id=? AND provider=? AND document_id=?",
+            (int(row["project_id"]), str(row.get("provider") or ""), str(row["document_id"])),
+        ).fetchone()
+        return int(saved["id"])
+
+
+def list_source_documents(project_id: int, db_path: str | Path = DEFAULT_DB_PATH) -> list[dict]:
+    with get_connection(db_path) as conn:
+        rows = [dict(row) for row in conn.execute(
+            "SELECT * FROM source_documents WHERE project_id=? ORDER BY filing_date DESC, id DESC",
+            (project_id,),
+        )]
+    for row in rows:
+        row["metadata"] = _decode_json_object(row.pop("metadata_json", "{}"))
+    return rows
+
+
+def _document_row_id(conn: sqlite3.Connection, project_id: int, document_id: str) -> int | None:
+    if not document_id:
+        return None
+    row = conn.execute(
+        "SELECT id FROM source_documents WHERE project_id=? AND document_id=? ORDER BY id DESC LIMIT 1",
+        (project_id, document_id),
+    ).fetchone()
+    return int(row["id"]) if row else None
+
+
+def save_financial_facts(facts: list[object], db_path: str | Path = DEFAULT_DB_PATH) -> None:
+    """根拠付き財務候補を保存する。手動修正値はNoneで上書きしない。"""
+    with get_connection(db_path) as conn:
+        for fact in facts:
+            row = _plain_dict(fact)
+            project_id = int(row["project_id"])
+            source_key = str(row.get("source_key") or _source_key("financial", row))
+            metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+            conn.execute(
+                """INSERT INTO financial_facts
+                   (project_id, source_key, document_row_id, common_key, raw_label, xbrl_tag,
+                    value, unit, fiscal_year, accounting_standard, source, manual_value,
+                    mapping_scope, status, confirmed_at, metadata_json, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                   ON CONFLICT(project_id, source_key) DO UPDATE SET
+                     document_row_id=COALESCE(excluded.document_row_id, financial_facts.document_row_id),
+                     common_key=COALESCE(NULLIF(excluded.common_key, ''), financial_facts.common_key),
+                     raw_label=COALESCE(NULLIF(excluded.raw_label, ''), financial_facts.raw_label),
+                     xbrl_tag=COALESCE(NULLIF(excluded.xbrl_tag, ''), financial_facts.xbrl_tag),
+                     value=COALESCE(excluded.value, financial_facts.value),
+                     unit=COALESCE(NULLIF(excluded.unit, ''), financial_facts.unit),
+                     fiscal_year=COALESCE(NULLIF(excluded.fiscal_year, ''), financial_facts.fiscal_year),
+                     accounting_standard=COALESCE(NULLIF(excluded.accounting_standard, ''), financial_facts.accounting_standard),
+                     source=COALESCE(NULLIF(excluded.source, ''), financial_facts.source),
+                     manual_value=COALESCE(excluded.manual_value, financial_facts.manual_value),
+                     mapping_scope=COALESCE(NULLIF(excluded.mapping_scope, ''), financial_facts.mapping_scope),
+                     status=COALESCE(NULLIF(excluded.status, ''), financial_facts.status),
+                     confirmed_at=COALESCE(NULLIF(excluded.confirmed_at, ''), financial_facts.confirmed_at),
+                     metadata_json=CASE WHEN excluded.metadata_json='{}' THEN financial_facts.metadata_json ELSE excluded.metadata_json END,
+                     updated_at=CURRENT_TIMESTAMP""",
+                (
+                    project_id, source_key, _document_row_id(conn, project_id, str(row.get("document_id") or "")),
+                    row.get("common_key"), str(row.get("raw_label") or ""), str(row.get("xbrl_tag") or ""),
+                    row.get("value"), str(row.get("unit") or ""), str(row.get("fiscal_year") or ""),
+                    str(row.get("accounting_standard") or ""), str(row.get("source") or ""),
+                    row.get("manual_value"), str(row.get("mapping_scope") or "unresolved"),
+                    str(row.get("status") or "candidate"), str(row.get("confirmed_at") or ""),
+                    json.dumps(metadata, ensure_ascii=False),
+                ),
+            )
+
+
+def list_financial_facts(project_id: int, db_path: str | Path = DEFAULT_DB_PATH) -> list[dict]:
+    with get_connection(db_path) as conn:
+        rows = [dict(row) for row in conn.execute(
+            "SELECT * FROM financial_facts WHERE project_id=? ORDER BY fiscal_year, common_key, id",
+            (project_id,),
+        )]
+    for row in rows:
+        row["metadata"] = _decode_json_object(row.pop("metadata_json", "{}"))
+    return rows
+
+
+def save_segment_facts(facts: list[object], db_path: str | Path = DEFAULT_DB_PATH) -> None:
+    """根拠付きセグメント候補を保存し、未確認名は候補のまま保持する。"""
+    with get_connection(db_path) as conn:
+        for fact in facts:
+            row = _plain_dict(fact)
+            project_id = int(row["project_id"])
+            source_key = str(row.get("source_key") or _source_key("segment", row))
+            metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+            conn.execute(
+                """INSERT INTO segment_facts
+                   (project_id, source_key, document_row_id, segment_name, raw_label, xbrl_tag,
+                    metric, value, unit, fiscal_year, source, manual_value, display_order,
+                    status, confirmed_at, metadata_json, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                   ON CONFLICT(project_id, source_key) DO UPDATE SET
+                     document_row_id=COALESCE(excluded.document_row_id, segment_facts.document_row_id),
+                     segment_name=COALESCE(NULLIF(excluded.segment_name, ''), segment_facts.segment_name),
+                     raw_label=COALESCE(NULLIF(excluded.raw_label, ''), segment_facts.raw_label),
+                     xbrl_tag=COALESCE(NULLIF(excluded.xbrl_tag, ''), segment_facts.xbrl_tag),
+                     metric=COALESCE(NULLIF(excluded.metric, ''), segment_facts.metric),
+                     value=COALESCE(excluded.value, segment_facts.value),
+                     unit=COALESCE(NULLIF(excluded.unit, ''), segment_facts.unit),
+                     fiscal_year=COALESCE(NULLIF(excluded.fiscal_year, ''), segment_facts.fiscal_year),
+                     source=COALESCE(NULLIF(excluded.source, ''), segment_facts.source),
+                     manual_value=COALESCE(excluded.manual_value, segment_facts.manual_value),
+                     display_order=COALESCE(excluded.display_order, segment_facts.display_order),
+                     status=COALESCE(NULLIF(excluded.status, ''), segment_facts.status),
+                     confirmed_at=COALESCE(NULLIF(excluded.confirmed_at, ''), segment_facts.confirmed_at),
+                     metadata_json=CASE WHEN excluded.metadata_json='{}' THEN segment_facts.metadata_json ELSE excluded.metadata_json END,
+                     updated_at=CURRENT_TIMESTAMP""",
+                (
+                    project_id, source_key, _document_row_id(conn, project_id, str(row.get("document_id") or "")),
+                    row.get("segment_name"), str(row.get("raw_label") or ""), str(row.get("xbrl_tag") or ""),
+                    str(row.get("metric") or "revenue"), row.get("value"), str(row.get("unit") or ""),
+                    str(row.get("fiscal_year") or ""), str(row.get("source") or ""), row.get("manual_value"),
+                    int(row.get("display_order") or 0), str(row.get("status") or "candidate"),
+                    str(row.get("confirmed_at") or ""), json.dumps(metadata, ensure_ascii=False),
+                ),
+            )
+
+
+def list_segment_facts(project_id: int, db_path: str | Path = DEFAULT_DB_PATH) -> list[dict]:
+    with get_connection(db_path) as conn:
+        rows = [dict(row) for row in conn.execute(
+            "SELECT * FROM segment_facts WHERE project_id=? ORDER BY fiscal_year, display_order, id",
+            (project_id,),
+        )]
+    for row in rows:
+        row["metadata"] = _decode_json_object(row.pop("metadata_json", "{}"))
+    return rows
+
+
+def _mapping_scope_key(row: dict) -> str:
+    scope_type = str(row.get("scope_type") or "").strip()
+    return "|".join((
+        scope_type,
+        str(row.get("project_id") or "") if scope_type == "company" else "",
+        str(row.get("accounting_standard") or "").strip().upper() if scope_type == "accounting" else "",
+        str(row.get("raw_identifier") or "").strip().casefold(),
+    ))
+
+
+def save_mapping_rule(rule: object, db_path: str | Path = DEFAULT_DB_PATH) -> None:
+    """ユーザーが確認した元タグ・元表記と共通項目の対応を保存する。"""
+    row = _plain_dict(rule)
+    if row.get("scope_type") not in {"company", "accounting", "global"}:
+        raise ValueError("マッピング範囲はcompany、accounting、globalから選択してください。")
+    if row.get("common_key") not in {
+        "revenue", "cost_of_sales", "gross_profit", "sga",
+        "operating_income", "ordinary_income", "net_income", "eps",
+    }:
+        raise ValueError("未対応の共通財務キーです。")
+    if not str(row.get("raw_identifier") or "").strip():
+        raise ValueError("元のXBRLタグまたは元表記が必要です。")
+    if row["scope_type"] == "company" and row.get("project_id") is None:
+        raise ValueError("企業固有マッピングにはproject_idが必要です。")
+    if row["scope_type"] == "accounting" and not str(row.get("accounting_standard") or "").strip():
+        raise ValueError("会計基準別マッピングには会計基準が必要です。")
+    confirmed_at = str(row.get("confirmed_at") or datetime.now().astimezone().isoformat(timespec="seconds"))
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """INSERT INTO mapping_rules
+               (scope_key, scope_type, project_id, accounting_standard, raw_identifier,
+                common_key, note, confirmed_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+               ON CONFLICT(scope_key) DO UPDATE SET common_key=excluded.common_key,
+                 note=excluded.note, confirmed_at=excluded.confirmed_at,
+                 updated_at=CURRENT_TIMESTAMP""",
+            (
+                _mapping_scope_key(row), row["scope_type"], row.get("project_id"),
+                str(row.get("accounting_standard") or ""), str(row["raw_identifier"]),
+                str(row["common_key"]), str(row.get("note") or ""), confirmed_at,
+            ),
+        )
+
+
+def list_mapping_rules(db_path: str | Path = DEFAULT_DB_PATH) -> list[dict]:
+    with get_connection(db_path) as conn:
+        return [dict(row) for row in conn.execute(
+            """SELECT scope_type, project_id, accounting_standard, raw_identifier,
+                      common_key, note, confirmed_at
+               FROM mapping_rules
+               ORDER BY CASE scope_type WHEN 'company' THEN 0 WHEN 'accounting' THEN 1 ELSE 2 END, id"""
+        )]
+
+
+def confirm_financial_fact_mapping(
+    fact_id: int,
+    common_key: str,
+    scope_type: str,
+    *,
+    manual_value: float | None = None,
+    db_path: str | Path = DEFAULT_DB_PATH,
+) -> None:
+    """候補確認と学習ルール保存を同じトランザクションで行う。"""
+    if common_key not in {
+        "revenue", "cost_of_sales", "gross_profit", "sga",
+        "operating_income", "ordinary_income", "net_income", "eps",
+    }:
+        raise ValueError("未対応の共通財務キーです。")
+    with get_connection(db_path) as conn:
+        fact = conn.execute("SELECT * FROM financial_facts WHERE id=?", (fact_id,)).fetchone()
+        if not fact:
+            raise ValueError("確認対象の財務候補が見つかりません。")
+        rule = {
+            "scope_type": scope_type,
+            "project_id": fact["project_id"] if scope_type == "company" else None,
+            "accounting_standard": fact["accounting_standard"] if scope_type == "accounting" else "",
+            "raw_identifier": fact["xbrl_tag"] or fact["raw_label"],
+            "common_key": common_key,
+        }
+        if scope_type not in {"company", "accounting", "global"}:
+            raise ValueError("マッピング範囲が不正です。")
+        confirmed_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        conn.execute(
+            """INSERT INTO mapping_rules
+               (scope_key, scope_type, project_id, accounting_standard, raw_identifier,
+                common_key, note, confirmed_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, '', ?, CURRENT_TIMESTAMP)
+               ON CONFLICT(scope_key) DO UPDATE SET common_key=excluded.common_key,
+                 confirmed_at=excluded.confirmed_at, updated_at=CURRENT_TIMESTAMP""",
+            (
+                _mapping_scope_key(rule), scope_type, rule["project_id"], rule["accounting_standard"],
+                rule["raw_identifier"], common_key, confirmed_at,
+            ),
+        )
+        conn.execute(
+            """UPDATE financial_facts SET common_key=?, mapping_scope=?, status='confirmed',
+               manual_value=COALESCE(?, manual_value), confirmed_at=?, updated_at=CURRENT_TIMESTAMP
+               WHERE id=?""",
+            (common_key, scope_type, manual_value, confirmed_at, fact_id),
+        )
