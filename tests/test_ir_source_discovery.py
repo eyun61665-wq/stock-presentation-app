@@ -1,7 +1,11 @@
 from urllib.parse import quote
 
-from ir_source_discovery import (SEARCH_URL, discover_ir_source,
+from ir_source_discovery import (SEARCH_URL, VERIFIED_IR_SOURCES, discover_ir_source,
                                  extract_search_result_urls)
+
+
+def test_takaoka_toko_has_verified_official_results_page():
+    assert VERIFIED_IR_SOURCES["6617"] == "https://www.tktk.co.jp/ir/library/report/"
 
 
 class FakeResponse:

@@ -18,6 +18,7 @@ CACHE_PATH = Path(__file__).resolve().parent / "data_cache" / "ir_source_map.jso
 # 実画面で取得確認済みの公式IRページ。自動探索結果もローカルキャッシュへ追加する。
 VERIFIED_IR_SOURCES = {
     "3355": "https://www.kuriyama-holdings.com/ir/library/earnings/",
+    "6617": "https://www.tktk.co.jp/ir/library/report/",
     "6651": "https://www.nito.co.jp/IR/library/results/",
     "7713": "https://www.sigma-koki.com/document_category/tansin/",
     "4343": "https://www.fantasy.co.jp/company/ircontent/library/library_02.html",
