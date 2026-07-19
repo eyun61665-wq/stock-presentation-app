@@ -385,10 +385,7 @@ def jquants_financial_fallback(stock_code: str, refresh_nonce: int = 0) -> dict:
         "pl_records": pl_records,
         "segment_records": [],
         "documents": [{"title": "J-Quants 財務サマリー", "url": "J-Quants"}],
-        "warnings": [
-            "公式PDFを取得できなかったため、PLはJ-Quantsへ自動で切り替えました。",
-            "セグメントは数値を推測せず、セグメント画面に空欄の入力表を表示します。",
-        ],
+        "warnings": ["PLの不足項目はJ-Quants財務サマリーで補完しました。"],
     }
 
 
