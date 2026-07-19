@@ -1534,9 +1534,9 @@ def catalyst_page() -> None:
     latest_actual = actual_rows[-1] if actual_rows else {}
     latest_sales = number(latest_actual.get("sales"))
     latest_operating_profit = number(latest_actual.get("operating_profit"))
-    default_margin = (
-        latest_operating_profit / latest_sales * 100 if latest_sales > 0 else 10.0
-    )
+    observed_margin = latest_operating_profit / latest_sales * 100 if latest_sales > 0 else 0.0
+    # 赤字企業でもカタリスト単体の採算まで赤字と決めつけず、編集可能な10％を初期値にする。
+    default_margin = observed_margin if observed_margin > 0 else 10.0
     default_shares = (
         number(project.get("shares_outstanding"))
         or number(latest_actual.get("shares_outstanding"))
@@ -1629,7 +1629,7 @@ def catalyst_page() -> None:
             low, standard, high = metric_slots(3)
             selected_impacts = [suggestion_impact(selected[key]) for key in ("low_impact", "standard_impact", "high_impact")]
             for slot, label, value in zip((low, standard, high), ("弱気", "標準", "強気"), selected_impacts):
-                slot.metric(f"{label}の株価影響", "算出不可" if value is None else f"+{value:,.1f}％")
+                slot.metric(f"{label}の株価影響", "算出不可" if value is None else f"{value:+,.1f}％")
             if any(value is None for value in selected_impacts):
                 st.info("株価影響を出すには、会社概要で現在株価と株式数を入力してください。")
             with st.expander("株価影響の計算根拠"):
@@ -1711,8 +1711,8 @@ def catalyst_page() -> None:
     impact_value = price_impact["impact_percent"]
     st.metric(
         "推定株価影響",
-        "算出不可" if impact_value is None else f"+{impact_value:,.1f}％",
-        None if price_impact["price_uplift"] is None else f"+{price_impact['price_uplift']:,.0f}円",
+        "算出不可" if impact_value is None else f"{impact_value:+,.1f}％",
+        None if price_impact["price_uplift"] is None else f"{price_impact['price_uplift']:+,.0f}円",
     )
     with st.expander("計算式と追加売上を見る"):
         st.write(f"追加売上：{additional:,.0f}百万円")
