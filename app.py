@@ -1098,8 +1098,18 @@ def financial_document_import_panel(project: dict, location: str) -> None:
                 save_project({"id": project_id, "ir_url": source_info["url"]})
                 count = _apply_financial_result(project_id, result, location)
                 if count:
-                    unit = "年度" if location == "pl" else "行"
-                    st.session_state[notice_key] = f"{target_label}を{count}{unit}取得し、下の表へ反映しました。"
+                    if location == "pl":
+                        displayed = select_recent_pl_records(result.get("pl_records", []), 3)
+                        actual_count = sum(
+                            str(row.get("result_type", "実績")) == "実績" for row in displayed
+                        )
+                        forecast_count = len(displayed) - actual_count
+                        forecast_text = f"、会社予想を{forecast_count}年度" if forecast_count else ""
+                        st.session_state[notice_key] = (
+                            f"PL実績を{actual_count}年度{forecast_text}取得し、下の表へ反映しました。"
+                        )
+                    else:
+                        st.session_state[notice_key] = f"{target_label}を{count}行取得し、下の表へ反映しました。"
                     st.rerun()
                 if location == "segment" and result.get("pl_records"):
                     st.warning("PLは取得できましたが、この資料からセグメント数値を安全に抽出できませんでした。")
@@ -1124,7 +1134,15 @@ def financial_document_import_panel(project: dict, location: str) -> None:
                         st.session_state[preview_key] = result
                     count = _apply_financial_result(project_id, result, location)
                     if count:
-                        st.session_state[notice_key] = f"J-QuantsからPLを{count}年度取得し、下の表へ反映しました。"
+                        displayed = select_recent_pl_records(result.get("pl_records", []), 3)
+                        actual_count = sum(
+                            str(row.get("result_type", "実績")) == "実績" for row in displayed
+                        )
+                        forecast_count = len(displayed) - actual_count
+                        forecast_text = f"、会社予想を{forecast_count}年度" if forecast_count else ""
+                        st.session_state[notice_key] = (
+                            f"J-QuantsからPL実績を{actual_count}年度{forecast_text}取得し、下の表へ反映しました。"
+                        )
                         st.rerun()
                     st.warning("公式IRとJ-QuantsのどちらからもPLを取得できませんでした。")
                 except (DataSourceError, JQuantsApiError, EDINETError, EDINETMasterError, ValueError, OSError) as fallback_exc:
