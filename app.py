@@ -151,6 +151,10 @@ def start_new_project() -> None:
 def set_active_project(project_id: int | None) -> None:
     """プログラム側で銘柄を切り替えたとき、PC・スマホの選択欄も同期する。"""
     st.session_state.project_id = project_id
+    # 銘柄切替・自動補完後に、直前のフォーム値が取得値を隠さないようにする。
+    for key in list(st.session_state):
+        if str(key).startswith("project_form_"):
+            st.session_state.pop(key, None)
     reset_navigation_widgets()
 
 
@@ -1151,12 +1155,13 @@ def project_page() -> None:
     st.divider()
     with st.form("project_form"):
         c1, c2, c3 = responsive_columns(3)
-        name = c1.text_input("プロジェクト名 *", value=project.get("project_name", "") if project else "")
-        company = c2.text_input("会社名", value=project.get("company_name", "") if project else "")
-        code = c3.text_input("銘柄コード", value=project.get("stock_code", "") if project else "")
+        form_suffix = str(project_id or "new")
+        name = c1.text_input("プロジェクト名 *", value=project.get("project_name", "") if project else "", key=f"project_form_name_{form_suffix}")
+        company = c2.text_input("会社名", value=project.get("company_name", "") if project else "", key=f"project_form_company_{form_suffix}")
+        code = c3.text_input("銘柄コード", value=project.get("stock_code", "") if project else "", key=f"project_form_code_{form_suffix}")
         c4, c5 = responsive_columns(2)
-        price = c4.number_input("現在株価（円）", min_value=0.0, value=number(project.get("current_price")) if project else 0.0, step=10.0)
-        shares = c5.number_input("発行済株式数（百万株）", min_value=0.0, value=number(project.get("shares_outstanding")) if project else 0.0, step=0.1, format="%.2f")
+        price = c4.number_input("現在株価（円）", min_value=0.0, value=number(project.get("current_price")) if project else 0.0, step=10.0, key=f"project_form_price_{form_suffix}")
+        shares = c5.number_input("発行済株式数（百万株）", min_value=0.0, value=number(project.get("shares_outstanding")) if project else 0.0, step=0.1, format="%.2f", key=f"project_form_shares_{form_suffix}")
         pl_entries = get_pl_entries(project_id) if project_id else []
         latest_eps = None
         for latest in reversed(pl_entries):
@@ -1191,13 +1196,13 @@ def project_page() -> None:
             column.metric(label, value, border=True)
         if project and project.get("ir_url"):
             st.caption("決算短信の取得先は銘柄コードから自動設定済みです。PL・セグメント画面で再取得できます。")
-        business = st.text_area("事業内容", value=project.get("business_description", "") if project else "", height=90)
+        business = st.text_area("事業内容", value=project.get("business_description", "") if project else "", height=90, key=f"project_form_business_{form_suffix}")
         text_left, text_right = responsive_columns(2)
-        strengths = text_left.text_area("会社の強み", value=project.get("strengths", "") if project else "", height=100)
-        thesis = text_right.text_area("投資仮説", value=project.get("investment_thesis", "") if project else "", height=100)
+        strengths = text_left.text_area("会社の強み", value=project.get("strengths", "") if project else "", height=100, key=f"project_form_strengths_{form_suffix}")
+        thesis = text_right.text_area("投資仮説", value=project.get("investment_thesis", "") if project else "", height=100, key=f"project_form_thesis_{form_suffix}")
         catalyst_col, risk_col = responsive_columns(2)
-        catalysts = catalyst_col.text_area("主なカタリスト", value=project.get("catalysts", "") if project else "", height=100)
-        risks = risk_col.text_area("主なリスク", value=project.get("risks", "") if project else "", height=100)
+        catalysts = catalyst_col.text_area("主なカタリスト", value=project.get("catalysts", "") if project else "", height=100, key=f"project_form_catalysts_{form_suffix}")
+        risks = risk_col.text_area("主なリスク", value=project.get("risks", "") if project else "", height=100, key=f"project_form_risks_{form_suffix}")
         submitted = st.form_submit_button("保存", type="primary")
     if submitted:
         data = {"id": project_id, "project_name": name, "company_name": company, "stock_code": code, "current_price": price,

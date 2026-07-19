@@ -27,6 +27,12 @@ def test_official_description_fills_only_empty_project_fields():
     assert "ガイドライン" in updated["catalysts"]
 
 
+def test_profile_has_safe_fallback_when_official_page_is_unavailable():
+    candidates = fetch_company_profile("", "テスト製造", "機械")
+    assert candidates["business_description"].startswith("確認候補：")
+    assert "公式資料で確認" in candidates["business_description"]
+
+
 def test_news_rss_keeps_source_url_and_classifies_rule_change():
     xml = '''<rss><channel><item><title>業界ガイドラインを改正</title>
       <link>https://example.go.jp/news</link><pubDate>Sun, 19 Jul 2026</pubDate>
