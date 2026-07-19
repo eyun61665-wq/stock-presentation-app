@@ -317,12 +317,28 @@ def enrich_project_profile(project_id: int, project: dict) -> dict:
     company_name = str(current.get("company_name") or current.get("project_name") or "").strip()
     stock_code = str(current.get("stock_code") or "").strip()
     ir_url = str(current.get("ir_url") or "").strip()
-    if stock_code and company_name and not ir_url:
+    verified_ir_url = VERIFIED_IR_SOURCES.get(stock_code, "")
+    source_changed = bool(verified_ir_url and ir_url and ir_url != verified_ir_url)
+    if verified_ir_url:
+        ir_url = verified_ir_url
+    elif stock_code and company_name and not ir_url:
         try:
             source = cached_ir_source(stock_code, company_name, "", 0)
             ir_url = source["url"]
         except (IRSourceDiscoveryError, DataSourceError, ValueError, OSError):
             pass
+    if source_changed:
+        # 別銘柄の自動生成候補だけを破棄する。通常の手入力文章は残す。
+        auto_prefixes = {
+            "business_description": ("確認候補：",),
+            "strengths": ("検討候補：",),
+            "investment_thesis": ("検討仮説：",),
+            "catalysts": ("候補：",),
+            "risks": ("主な確認点：",),
+        }
+        for field, prefixes in auto_prefixes.items():
+            if str(current.get(field) or "").startswith(prefixes):
+                current[field] = ""
     try:
         candidates = cached_company_profile(
             ir_url,
