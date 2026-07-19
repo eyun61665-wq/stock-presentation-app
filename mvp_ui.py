@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import date
+import unicodedata
 from typing import Any
 
 import altair as alt
@@ -9,13 +10,16 @@ import pandas as pd
 import streamlit as st
 
 from database import (
+    DEFAULT_DB_PATH,
     delete_project,
+    get_migration_report,
     get_pl_entries,
     get_project,
     get_project_mvp_data,
     get_segment_entries,
     initialize_database,
     list_projects,
+    normalize_result_type,
     rename_project,
     save_pl_entries,
     save_project,
@@ -80,6 +84,20 @@ def _records(frame: pd.DataFrame) -> list[dict[str, Any]]:
     return frame.where(pd.notnull(frame), None).to_dict("records")
 
 
+def _has_value(value: Any) -> bool:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return False
+    return bool(str(value).strip()) if isinstance(value, str) else True
+
+
+def _period_title(row: dict[str, Any]) -> str:
+    year = str(row.get("fiscal_year") or "").strip()
+    kind = normalize_result_type(row.get("result_type"))
+    if year in {kind, "独自予想"}:
+        return "独自予想" if kind == "自分予想" else kind
+    return f"{year} {kind}".strip()
+
+
 def _number(value: Any) -> float | None:
     return parse_number(value)
 
@@ -123,24 +141,31 @@ def _pl_calculated(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def _five_period_records(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    actual = sorted((row for row in entries if row.get("result_type") == "実績"), key=lambda row: str(row.get("fiscal_year")))[-3:]
-    company = sorted((row for row in entries if row.get("result_type") == "会社予想"), key=lambda row: str(row.get("fiscal_year")))[-1:]
-    own = sorted((row for row in entries if row.get("result_type") == "自分予想"), key=lambda row: str(row.get("fiscal_year")))[-1:]
+    clean = [dict(row, result_type=normalize_result_type(row.get("result_type"))) for row in entries]
+    actual = sorted((row for row in clean if row.get("result_type") == "実績"), key=lambda row: str(row.get("fiscal_year")))[-3:]
+    company = sorted((row for row in clean if row.get("result_type") == "会社予想"), key=lambda row: str(row.get("fiscal_year")))[-1:]
+    own = sorted((row for row in clean if row.get("result_type") == "自分予想"), key=lambda row: str(row.get("fiscal_year")))[-1:]
     default_actual = ["3期前実績", "2期前実績", "前期実績"]
     missing = 3 - len(actual)
     actual_rows = [
-        {"fiscal_year": label, "result_type": "実績"} for label in default_actual[:missing]
+        {"fiscal_year": label, "result_type": "実績", "_placeholder": True} for label in default_actual[:missing]
     ] + [dict(row) for row in actual]
-    company_row = dict(company[0]) if company else {"fiscal_year": "会社予想", "result_type": "会社予想"}
-    own_row = dict(own[0]) if own else {"fiscal_year": "独自予想", "result_type": "自分予想"}
+    company_row = dict(company[0]) if company else {"fiscal_year": "会社予想", "result_type": "会社予想", "_placeholder": True}
+    own_row = dict(own[0]) if own else {"fiscal_year": "独自予想", "result_type": "自分予想", "_placeholder": True}
     return [*actual_rows, company_row, own_row]
 
 
 def _pl_edit_frame(entries: list[dict[str, Any]]) -> pd.DataFrame:
     rows = []
     for entry in _five_period_records(entries):
-        rows.append({label: entry.get(key) for label, key in PL_INPUT_COLUMNS.items()})
-    return pd.DataFrame(rows, columns=list(PL_INPUT_COLUMNS))
+        rows.append({"_id": entry.get("id"), "_placeholder": entry.get("_placeholder", False),
+                     **{label: entry.get(key) for label, key in PL_INPUT_COLUMNS.items()}})
+    frame = pd.DataFrame(rows, columns=["_id", "_placeholder", *PL_INPUT_COLUMNS])
+    for column in list(PL_INPUT_COLUMNS)[2:10]:
+        frame[column] = frame[column].map(lambda value: _format(value, "eps" if column == "EPS" else "amount"))
+    for column in ["年度名", "区分", "出典", "基準日"]:
+        frame[column] = frame[column].fillna("")
+    return frame
 
 
 def _pl_records_from_editor(frame: pd.DataFrame) -> list[dict[str, Any]]:
@@ -151,10 +176,17 @@ def _pl_records_from_editor(frame: pd.DataFrame) -> list[dict[str, Any]]:
             continue
         row = {key: raw.get(label) for label, key in PL_INPUT_COLUMNS.items()}
         row["fiscal_year"] = year
-        row["result_type"] = str(row.get("result_type") or "実績")
+        row["result_type"] = normalize_result_type(row.get("result_type"))
         for key in ("sales", "cost_of_sales", "sga_expenses", "operating_profit", "ordinary_profit",
                     "net_income", "reported_eps", "shares_outstanding"):
             row[key] = _number(row.get(key))
+        row["id"] = raw.get("_id")
+        meaningful = any(_has_value(row.get(key)) for key in (
+            "sales", "cost_of_sales", "sga_expenses", "operating_profit", "ordinary_profit",
+            "net_income", "reported_eps", "shares_outstanding", "source", "basis_date",
+        ))
+        if raw.get("_placeholder") and not meaningful:
+            continue
         rows.append(row)
     return rows
 
@@ -172,7 +204,7 @@ def _pl_matrix(entries: list[dict[str, Any]]) -> pd.DataFrame:
     for label, key, kind in PL_DISPLAY_ROWS:
         record = {"項目": label}
         for row in calculated:
-            title = f"{row.get('fiscal_year', '')} {row.get('result_type', '')}"
+            title = _period_title(row)
             record[title] = _format(row.get(key), kind)
         rows.append(record)
     return pd.DataFrame(rows)
@@ -205,6 +237,20 @@ def _line_chart(frame: pd.DataFrame, x: str, series: list[str], value_title: str
         tooltip=[alt.Tooltip(f"{x}:N"), alt.Tooltip("系列:N"), alt.Tooltip("値:Q", format=",.2f")],
     )
     st.altair_chart(chart, width="stretch")
+
+
+def _bar_chart(frame: pd.DataFrame, x: str, y: str) -> None:
+    """数値がない場合はVegaへ渡さず、無限範囲警告を防ぐ。"""
+    clean = frame.copy()
+    if x not in clean or y not in clean:
+        st.caption("グラフに表示できる数値がありません。")
+        return
+    clean[y] = pd.to_numeric(clean[y], errors="coerce")
+    clean = clean.dropna(subset=[x, y])
+    if clean.empty:
+        st.caption("グラフに表示できる数値がありません。")
+        return
+    st.bar_chart(clean, x=x, y=y)
 
 
 @st.cache_data(show_spinner=False, ttl=900, max_entries=20)
@@ -355,15 +401,19 @@ def _pl_tab(project: dict, data: dict, edit_mode: bool) -> None:
                     frame.loc[len(frame) - 1, target_col] = candidate.get("候補値")
         edited = st.data_editor(
             frame, hide_index=True, key=f"pl_editor_{project_id}",
-            column_config={"区分": st.column_config.SelectboxColumn("区分", options=["実績", "会社予想", "自分予想"]),
-                           **{col: st.column_config.NumberColumn(col, format="%,.2f") for col in list(PL_INPUT_COLUMNS)[2:10]}},
+            column_config={"_id": None, "_placeholder": None,
+                           "区分": st.column_config.SelectboxColumn("区分", options=["実績", "会社予想", "自分予想"]),
+                           **{col: st.column_config.TextColumn(col) for col in list(PL_INPUT_COLUMNS)[2:10]}},
         )
         if st.button("PLを保存", type="primary", icon=":material/save:", key=f"save_pl_{project_id}"):
             edited_records = _pl_records_from_editor(edited)
-            save_pl_entries(project_id, _merge_by_period(entries, edited_records))
-            save_project_mvp_data(project_id, settings={**settings, "pl_unit": unit})
-            st.success("PLを保存しました。")
-            st.rerun()
+            if entries and not edited_records:
+                st.warning("空の表では既存PLを上書きしません。年度と数値を確認してください。")
+            else:
+                save_pl_entries(project_id, edited_records)
+                save_project_mvp_data(project_id, settings={**settings, "pl_unit": unit})
+                st.success("PLを保存しました。")
+                st.rerun()
     matrix = _pl_matrix(get_pl_entries(project_id))
     st.dataframe(matrix, hide_index=True, column_config={"項目": st.column_config.TextColumn("項目", pinned=True)})
     calculated = [_pl_calculated(row) for row in _five_period_records(get_pl_entries(project_id))]
@@ -380,6 +430,7 @@ def _pl_tab(project: dict, data: dict, edit_mode: bool) -> None:
 
 
 def _segment_matrix(entries: list[dict[str, Any]]) -> pd.DataFrame:
+    entries = [dict(row, result_type=normalize_result_type(row.get("result_type"))) for row in entries]
     actual = sorted(
         set((str(row.get("fiscal_year")), "実績") for row in entries if row.get("result_type") == "実績")
     )[-3:]
@@ -393,21 +444,25 @@ def _segment_matrix(entries: list[dict[str, Any]]) -> pd.DataFrame:
         set((str(row.get("fiscal_year")), "自分予想") for row in entries if row.get("result_type") == "自分予想")
     )[-1:] or [("独自予想", "自分予想")]
     periods = [*actual, *company, *own]
-    names = list(dict.fromkeys(str(row.get("segment_name")) for row in sorted(entries, key=lambda row: (row.get("display_order", 0), str(row.get("segment_name"))))))
+    names = list(dict.fromkeys(
+        str(row.get("segment_name")) for row in sorted(
+            entries, key=lambda row: (row.get("display_order", 0), row.get("id", 0), str(row.get("segment_name")))
+        ) if str(row.get("segment_name") or "").strip()
+    ))
     lookup = {(str(row.get("fiscal_year")), str(row.get("result_type")), str(row.get("segment_name"))): row.get("sales") for row in entries}
     rows = []
     total = {"項目": "売上高（①＋②＋③＋…）"}
     for year, result_type in periods:
-        title = f"{year} {result_type}"
+        title = _period_title({"fiscal_year": year, "result_type": result_type})
         values = [_number(lookup.get((year, result_type, name))) for name in names]
         total[title] = sum(value for value in values if value is not None) if any(value is not None for value in values) else None
     rows.append(total)
     for index, name in enumerate(names, start=1):
         row = {"項目": f"{index}：{name}"}
         for year, result_type in periods:
-            row[f"{year} {result_type}"] = lookup.get((year, result_type, name))
+            row[_period_title({"fiscal_year": year, "result_type": result_type})] = lookup.get((year, result_type, name))
         rows.append(row)
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows).where(lambda frame: frame.notna(), "")
 
 
 def _segment_tab(project: dict, data: dict, edit_mode: bool) -> None:
@@ -419,21 +474,27 @@ def _segment_tab(project: dict, data: dict, edit_mode: bool) -> None:
     if edit_mode:
         _pdf_panel(project_id, "segment", f"pdf_segment_selected_{project_id}")
         frame = pd.DataFrame([{
-            "年度名": row.get("fiscal_year"), "区分": row.get("result_type"), "セグメント名": row.get("segment_name"),
+            "_id": row.get("id"), "年度名": row.get("fiscal_year"), "区分": normalize_result_type(row.get("result_type")), "セグメント名": row.get("segment_name"),
             "売上高": row.get("sales"), "利益": row.get("operating_profit"), "行種別": row.get("row_type", "セグメント"),
             "並び順": row.get("display_order", 0), "出典": row.get("source", "手入力"), "メモ": row.get("note", ""),
-        } for row in entries], columns=["年度名", "区分", "セグメント名", "売上高", "利益", "行種別", "並び順", "出典", "メモ"])
+        } for row in entries], columns=["_id", "年度名", "区分", "セグメント名", "売上高", "利益", "行種別", "並び順", "出典", "メモ"])
+        for column in ["売上高", "利益"]:
+            frame[column] = frame[column].map(lambda value: _format(value, "amount"))
+        frame["並び順"] = pd.to_numeric(frame["並び順"], errors="coerce").fillna(0).astype(int)
+        for column in ["年度名", "区分", "セグメント名", "行種別", "出典", "メモ"]:
+            frame[column] = frame[column].fillna("")
         selected_pdf = st.session_state.pop(f"pdf_segment_selected_{project_id}", [])
         for candidate in selected_pdf:
-            frame.loc[len(frame)] = [candidate.get("年度") or "", "実績", candidate.get("項目") or "要確認",
+            frame.loc[len(frame)] = [None, candidate.get("年度") or "", "実績", candidate.get("項目") or "要確認",
                                      candidate.get("候補値"), None, "セグメント", len(frame), "決算資料PDF",
                                      f"p.{candidate.get('ページ')} {candidate.get('周辺原文', '')}"]
         edited = st.data_editor(
             frame, hide_index=True, num_rows="dynamic", key=f"segment_editor_{project_id}",
-            column_config={"区分": st.column_config.SelectboxColumn("区分", options=["実績", "会社予想", "自分予想"]),
+            column_config={"_id": None,
+                           "区分": st.column_config.SelectboxColumn("区分", options=["実績", "会社予想", "自分予想"]),
                            "行種別": st.column_config.SelectboxColumn("行種別", options=["セグメント", "調整額", "内部取引消去", "その他調整"]),
-                           "売上高": st.column_config.NumberColumn("売上高", format="%,.2f"),
-                           "利益": st.column_config.NumberColumn("利益", format="%,.2f")},
+                           "売上高": st.column_config.TextColumn("売上高"),
+                           "利益": st.column_config.TextColumn("利益")},
         )
         unit = st.text_input("セグメント金額単位", value=settings.get("segment_unit", settings.get("pl_unit", "百万円")))
         if st.button("セグメントを保存", type="primary", icon=":material/save:"):
@@ -441,15 +502,18 @@ def _segment_tab(project: dict, data: dict, edit_mode: bool) -> None:
             for raw in _records(edited):
                 if not str(raw.get("年度名") or "").strip() or not str(raw.get("セグメント名") or "").strip():
                     continue
-                rows.append({"fiscal_year": str(raw["年度名"]), "result_type": str(raw.get("区分") or "実績"),
+                rows.append({"id": raw.get("_id"), "fiscal_year": str(raw["年度名"]), "result_type": normalize_result_type(raw.get("区分")),
                              "segment_name": str(raw["セグメント名"]), "sales": _number(raw.get("売上高")),
                              "operating_profit": _number(raw.get("利益")), "row_type": raw.get("行種別") or "セグメント",
                              "display_order": int(_number(raw.get("並び順")) or 0), "source": raw.get("出典") or "手入力",
                              "note": raw.get("メモ") or ""})
-            save_segment_entries(project_id, rows)
-            save_project_mvp_data(project_id, settings={**settings, "segment_unit": unit})
-            st.success("セグメントを保存しました。")
-            st.rerun()
+            if entries and not rows:
+                st.warning("空の表では既存セグメントを上書きしません。年度とセグメント名を確認してください。")
+            else:
+                save_segment_entries(project_id, rows)
+                save_project_mvp_data(project_id, settings={**settings, "segment_unit": unit})
+                st.success("セグメントを保存しました。")
+                st.rerun()
     entries = get_segment_entries(project_id)
     matrix = _segment_matrix(entries)
     st.dataframe(matrix, hide_index=True, column_config={"項目": st.column_config.TextColumn("項目", pinned=True)})
@@ -571,13 +635,13 @@ def _kpi_tab(project: dict, data: dict, edit_mode: bool) -> None:
     c1, c2 = st.columns(2)
     with c1.container(border=True):
         st.markdown("**弱気・標準・強気の売上比較**")
-        st.bar_chart(pd.DataFrame({"シナリオ": [SCENARIO_LABELS[s] for s in SCENARIOS], "売上": [totals[s] for s in SCENARIOS]}), x="シナリオ", y="売上")
+        _bar_chart(pd.DataFrame({"シナリオ": [SCENARIO_LABELS[s] for s in SCENARIOS], "売上": [totals[s] for s in SCENARIOS]}), x="シナリオ", y="売上")
     with c2.container(border=True):
         st.markdown("**KPI別の増収寄与**")
-        st.bar_chart(contribution_frame, x="KPI", y="増収寄与")
+        _bar_chart(contribution_frame, x="KPI", y="増収寄与")
     with st.container(border=True):
         st.markdown("**基準売上と標準予想売上の比較**")
-        st.bar_chart(
+        _bar_chart(
             pd.DataFrame({"区分": ["基準", "標準予想"], "売上": [totals["base"], totals["standard"]]}),
             x="区分",
             y="売上",
@@ -669,7 +733,10 @@ def _memo_tab(project: dict, data: dict, edit_mode: bool) -> None:
 
 def _sidebar() -> tuple[dict | None, bool]:
     projects = list_projects()
-    labels = {row["id"]: f"{row['project_name']}（{row.get('stock_code') or 'コード未設定'}）" for row in projects}
+    labels = {
+        row["id"]: f"{row['project_name']}（{row.get('stock_code') or 'コード未設定'} / ID {row['id']}）"
+        for row in projects
+    }
     ids = list(labels)
     selected_default = st.session_state.get("mvp_project_id")
     if selected_default not in ids:
@@ -688,13 +755,34 @@ def _sidebar() -> tuple[dict | None, bool]:
     st.session_state["mvp_project_id"] = selected
     with st.sidebar.expander("新規プロジェクト作成", icon=":material/add:"):
         name = st.text_input("新しいプロジェクト名", key="new_mvp_project")
+        normalized_name = unicodedata.normalize("NFKC", name).strip().casefold()
+        duplicates = [
+            row for row in projects
+            if unicodedata.normalize("NFKC", str(row.get("project_name") or "")).strip().casefold() == normalized_name
+        ] if normalized_name else []
+        allow_duplicate = False
+        if duplicates:
+            st.warning(f"同名プロジェクトが{len(duplicates)}件あります。既存プロジェクトの選択を推奨します。")
+            allow_duplicate = st.checkbox("同名でも新規作成する", key="allow_duplicate_mvp_project")
         if st.button("作成", type="primary", key="create_mvp_project"):
             if not name.strip():
                 st.error("プロジェクト名を入力してください。")
+            elif duplicates and not allow_duplicate:
+                st.error("同名プロジェクトを確認し、必要な場合だけチェックを付けてください。")
             else:
                 project_id = save_project({"project_name": name.strip()})
                 st.session_state["mvp_project_id"] = project_id
                 st.rerun()
+    with st.sidebar.expander("データ保存先", icon=":material/database:"):
+        st.code(str(DEFAULT_DB_PATH.resolve()), language=None)
+        st.caption("ローカル版とStreamlit公開版のSQLiteは別環境で、自動同期されません。")
+        report = get_migration_report()
+        if report:
+            st.caption(
+                f"最終互換移行：新規{report.get('projects_created', 0)}件、更新{report.get('projects_updated', 0)}件、"
+                f"補完{report.get('fields_filled', 0)}項目。旧PL {report.get('pl_rows_reused', 0)}件・"
+                f"旧セグメント {report.get('segment_rows_reused', 0)}件を継続利用。"
+            )
     edit_mode = st.sidebar.segmented_control("モード", ["閲覧", "編集"], default="閲覧", key="mvp_mode") == "編集"
     if selected is not None:
         current = get_project(selected)

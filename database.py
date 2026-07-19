@@ -9,7 +9,7 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = BASE_DIR / "stock_projects.db"
-SCHEMA_VERSION = "11"
+SCHEMA_VERSION = "12"
 API_PROJECT_COLUMNS = {
     "company_name_en": "TEXT DEFAULT ''", "market": "TEXT DEFAULT ''", "sector17": "TEXT DEFAULT ''",
     "sector33": "TEXT DEFAULT ''", "price_date": "TEXT DEFAULT ''", "data_retrieved_at": "TEXT DEFAULT ''",
@@ -64,6 +64,68 @@ def _backup_database(db_path: Path) -> Path:
     return backup
 
 
+def _is_blank(value: object) -> bool:
+    """Noneや空文字など、既存値を置き換えてはいけない空値を判定する。"""
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, (list, tuple, dict, set)):
+        return not value
+    return False
+
+
+def _fill_blanks(primary: dict, fallback: dict) -> tuple[dict, int]:
+    """primaryの空欄だけをfallbackで補い、補完した項目数も返す。"""
+    merged = dict(primary)
+    changed = 0
+    for key, value in fallback.items():
+        if _is_blank(merged.get(key)) and not _is_blank(value):
+            merged[key] = value
+            changed += 1
+    return merged, changed
+
+
+def normalize_result_type(value: object) -> str:
+    """旧画面を含む区分表記を、実績・会社予想・自分予想へ統一する。"""
+    text = str(value or "").strip()
+    aliases = {
+        "actual": "実績", "Actual": "実績", "本決算": "実績",
+        "forecast": "会社予想", "company_forecast": "会社予想", "会社予測": "会社予想",
+        "自社予想": "自分予想", "独自予想": "自分予想", "own_forecast": "自分予想",
+    }
+    return aliases.get(text, text or "実績")
+
+
+def _legacy_mvp_fallback(project: dict) -> dict[str, dict]:
+    """実在する旧projectsカラムから、新画面の項目へ明示的に対応付ける。"""
+    business = project.get("business_description")
+    strengths = project.get("strengths")
+    thesis = project.get("investment_thesis")
+    catalysts = project.get("catalysts")
+    risks = project.get("risks")
+    ir_url = project.get("ir_url")
+    return {
+        "overview": {
+            "what_company": business,
+            "competitive_strength": strengths,
+            "attention_points": risks,
+        },
+        "catalyst": {
+            "main": catalysts,
+            "reference_url": ir_url,
+        },
+        "memo": {
+            "company_overview": business,
+            "strengths": strengths,
+            "investment_thesis": thesis,
+            "catalyst": catalysts,
+            "risks": risks,
+            "reference_urls": ir_url,
+        },
+    }
+
+
 def initialize_database(db_path: str | Path = DEFAULT_DB_PATH) -> None:
     path = Path(db_path)
     legacy = False
@@ -72,9 +134,15 @@ def initialize_database(db_path: str | Path = DEFAULT_DB_PATH) -> None:
     needs_forecast_schema = False
     needs_segment_metrics_table = False
     needs_mvp_table = False
+    schema_outdated = False
     if path.exists():
         with get_connection(path) as conn:
             legacy = _table_exists(conn, "projects") and not _table_exists(conn, "app_metadata")
+            if _table_exists(conn, "app_metadata"):
+                version_row = conn.execute(
+                    "SELECT value FROM app_metadata WHERE key='schema_version'"
+                ).fetchone()
+                schema_outdated = version_row is None or str(version_row["value"]) != SCHEMA_VERSION
             if _table_exists(conn, "pl_entries"):
                 table_sql = str(conn.execute(
                     "SELECT sql FROM sqlite_master WHERE type='table' AND name='pl_entries'"
@@ -92,7 +160,7 @@ def initialize_database(db_path: str | Path = DEFAULT_DB_PATH) -> None:
                     needs_table_columns = needs_table_columns or bool(set(columns) - existing)
             needs_segment_metrics_table = not _table_exists(conn, "segment_metrics")
             needs_mvp_table = not _table_exists(conn, "project_mvp_data")
-        if (legacy or needs_api_columns or needs_table_columns or needs_forecast_schema
+        if (legacy or schema_outdated or needs_api_columns or needs_table_columns or needs_forecast_schema
                 or needs_segment_metrics_table or needs_mvp_table):
             _backup_database(path)
 
@@ -184,7 +252,86 @@ def initialize_database(db_path: str | Path = DEFAULT_DB_PATH) -> None:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
         if needs_forecast_schema:
             _migrate_forecast_tables(conn)
+        migration_report = _migrate_legacy_project_data_in_connection(conn)
+        if migration_report["projects_created"] or migration_report["fields_filled"]:
+            conn.execute(
+                "INSERT OR REPLACE INTO app_metadata (key, value) VALUES ('legacy_mvp_bridge_report', ?)",
+                (json.dumps(migration_report, ensure_ascii=False),),
+            )
         conn.execute("INSERT OR REPLACE INTO app_metadata (key, value) VALUES ('schema_version', ?)", (SCHEMA_VERSION,))
+
+
+def _decode_json_object(value: object) -> dict:
+    try:
+        loaded = json.loads(str(value or "{}"))
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _migrate_legacy_project_data_in_connection(conn: sqlite3.Connection) -> dict[str, object]:
+    """旧projectsの説明項目を新JSONの空欄だけへ移す。PL・セグメントは既存表を継続利用する。"""
+    report: dict[str, object] = {
+        "migration": "legacy_project_fields_to_mvp_v1",
+        "executed_at": datetime.now().isoformat(timespec="seconds"),
+        "projects_examined": 0,
+        "projects_created": 0,
+        "projects_updated": 0,
+        "fields_filled": 0,
+        "pl_rows_reused": 0,
+        "segment_rows_reused": 0,
+    }
+    if not _table_exists(conn, "projects") or not _table_exists(conn, "project_mvp_data"):
+        return report
+    project_columns = {row["name"] for row in conn.execute("PRAGMA table_info(projects)")}
+    selectable = [name for name in (
+        "id", "business_description", "strengths", "investment_thesis", "catalysts", "risks", "ir_url"
+    ) if name in project_columns]
+    if "id" not in selectable:
+        return report
+    for row in conn.execute(f"SELECT {', '.join(selectable)} FROM projects ORDER BY id"):
+        project = dict(row)
+        report["projects_examined"] = int(report["projects_examined"]) + 1
+        fallback = _legacy_mvp_fallback(project)
+        existing = conn.execute(
+            "SELECT * FROM project_mvp_data WHERE project_id=?", (project["id"],)
+        ).fetchone()
+        current = {
+            "overview": _decode_json_object(existing["overview_json"]) if existing else {},
+            "settings": _decode_json_object(existing["settings_json"]) if existing else {},
+            "kpi": _decode_json_object(existing["kpi_json"]) if existing else {},
+            "catalyst": _decode_json_object(existing["catalyst_json"]) if existing else {},
+            "memo": _decode_json_object(existing["memo_json"]) if existing else {},
+        }
+        changed = 0
+        for section in ("overview", "catalyst", "memo"):
+            current[section], filled = _fill_blanks(current[section], fallback[section])
+            changed += filled
+        if not changed:
+            continue
+        encoded = [json.dumps(current[key], ensure_ascii=False) for key in MVP_DATA_DEFAULTS]
+        conn.execute(
+            """INSERT INTO project_mvp_data
+               (project_id, schema_version, overview_json, settings_json, kpi_json,
+                catalyst_json, memo_json, updated_at)
+               VALUES (?, 1, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+               ON CONFLICT(project_id) DO UPDATE SET
+                 overview_json=excluded.overview_json,
+                 catalyst_json=excluded.catalyst_json,
+                 memo_json=excluded.memo_json,
+                 updated_at=CURRENT_TIMESTAMP""",
+            (project["id"], *encoded),
+        )
+        if existing:
+            report["projects_updated"] = int(report["projects_updated"]) + 1
+        else:
+            report["projects_created"] = int(report["projects_created"]) + 1
+        report["fields_filled"] = int(report["fields_filled"]) + changed
+    if _table_exists(conn, "pl_entries"):
+        report["pl_rows_reused"] = int(conn.execute("SELECT COUNT(*) FROM pl_entries").fetchone()[0])
+    if _table_exists(conn, "segment_entries"):
+        report["segment_rows_reused"] = int(conn.execute("SELECT COUNT(*) FROM segment_entries").fetchone()[0])
+    return report
 
 
 def _migrate_forecast_tables(conn: sqlite3.Connection) -> None:
@@ -331,21 +478,48 @@ MVP_DATA_DEFAULTS = {
 }
 
 
+def migrate_legacy_project_data(db_path: str | Path = DEFAULT_DB_PATH) -> dict[str, object]:
+    """旧会社情報を新JSONの空欄へ安全に補完する。何度実行しても重複しない。"""
+    path = Path(db_path)
+    if path.exists():
+        _backup_database(path)
+    with get_connection(path) as conn:
+        report = _migrate_legacy_project_data_in_connection(conn)
+        if report["projects_created"] or report["fields_filled"]:
+            conn.execute(
+                "INSERT OR REPLACE INTO app_metadata (key, value) VALUES ('legacy_mvp_bridge_report', ?)",
+                (json.dumps(report, ensure_ascii=False),),
+            )
+    return report
+
+
+def get_migration_report(db_path: str | Path = DEFAULT_DB_PATH) -> dict[str, object]:
+    """最後に実データを補完した移行結果を返す。"""
+    with get_connection(db_path) as conn:
+        if not _table_exists(conn, "app_metadata"):
+            return {}
+        row = conn.execute(
+            "SELECT value FROM app_metadata WHERE key='legacy_mvp_bridge_report'"
+        ).fetchone()
+    return _decode_json_object(row["value"]) if row else {}
+
+
 def get_project_mvp_data(project_id: int, db_path: str | Path = DEFAULT_DB_PATH) -> dict:
     with get_connection(db_path) as conn:
         row = conn.execute("SELECT * FROM project_mvp_data WHERE project_id=?", (project_id,)).fetchone()
     result = {key: dict(value) for key, value in MVP_DATA_DEFAULTS.items()}
     result["schema_version"] = 1
-    if not row:
-        return result
-    for key in MVP_DATA_DEFAULTS:
-        try:
-            loaded = json.loads(row[f"{key}_json"] or "{}")
-        except (json.JSONDecodeError, TypeError):
-            loaded = {}
-        result[key] = loaded if isinstance(loaded, dict) else dict(MVP_DATA_DEFAULTS[key])
-    result["schema_version"] = int(row["schema_version"] or 1)
-    result["updated_at"] = row["updated_at"]
+    if row:
+        for key in MVP_DATA_DEFAULTS:
+            loaded = _decode_json_object(row[f"{key}_json"])
+            result[key] = {**dict(MVP_DATA_DEFAULTS[key]), **loaded}
+        result["schema_version"] = int(row["schema_version"] or 1)
+        result["updated_at"] = row["updated_at"]
+    project = get_project(project_id, db_path)
+    if project:
+        fallback = _legacy_mvp_fallback(project)
+        for section in ("overview", "catalyst", "memo"):
+            result[section], _ = _fill_blanks(result[section], fallback[section])
     return result
 
 
@@ -389,14 +563,18 @@ def save_project_mvp_data(
 
 def get_pl_entries(project_id: int, db_path: str | Path = DEFAULT_DB_PATH) -> list[dict]:
     with get_connection(db_path) as conn:
-        return [dict(row) for row in conn.execute("""
+        rows = [dict(row) for row in conn.execute("""
             SELECT * FROM pl_entries WHERE project_id=?
             ORDER BY fiscal_year,
                 CASE result_type WHEN '実績' THEN 0 WHEN '会社予想' THEN 1 ELSE 2 END
         """, (project_id,))]
+    for row in rows:
+        row["result_type"] = normalize_result_type(row.get("result_type"))
+    return rows
 
 
 def save_pl_entries(project_id: int, entries: list[dict], db_path: str | Path = DEFAULT_DB_PATH) -> None:
+    """PLを行単位で更新し、渡されなかった旧行やNoneの既存値を保持する。"""
     fields = [
         "fiscal_year", "result_type", "sales", "operating_profit", "net_income",
         "shares_outstanding", "cost_of_sales", "gross_profit", "sga_expenses",
@@ -418,15 +596,49 @@ def save_pl_entries(project_id: int, entries: list[dict], db_path: str | Path = 
     }
 
     def value(row: dict, field: str):
-        default = "手入力" if field == "source" else ("" if field == "basis_date" else None)
-        return row.get(field, row.get(labels[field], default))
+        return row.get(field, row.get(labels[field]))
 
+    normalized: list[dict] = []
+    for raw in entries:
+        fiscal_year = str(value(raw, "fiscal_year") or "").strip()
+        if not fiscal_year:
+            continue
+        row = {field: value(raw, field) for field in fields}
+        row["fiscal_year"] = fiscal_year
+        row["result_type"] = normalize_result_type(row.get("result_type"))
+        row["id"] = raw.get("id")
+        normalized.append(row)
+    if not normalized:
+        return
     with get_connection(db_path) as conn:
-        conn.execute("DELETE FROM pl_entries WHERE project_id=?", (project_id,))
-        conn.executemany(
-            f"INSERT INTO pl_entries (project_id, {', '.join(fields)}) VALUES (?, {', '.join('?' for _ in fields)})",
-            [(project_id, *[value(row, field) for field in fields]) for row in entries],
-        )
+        for row in normalized:
+            existing = None
+            if row.get("id") is not None:
+                existing = conn.execute(
+                    "SELECT * FROM pl_entries WHERE id=? AND project_id=?", (row["id"], project_id)
+                ).fetchone()
+            if existing is None:
+                existing = conn.execute(
+                    "SELECT * FROM pl_entries WHERE project_id=? AND fiscal_year=? AND result_type=?",
+                    (project_id, row["fiscal_year"], row["result_type"]),
+                ).fetchone()
+            merged = dict(existing) if existing else {}
+            for field in fields:
+                incoming = row.get(field)
+                if not _is_blank(incoming):
+                    merged[field] = incoming
+                elif field not in merged:
+                    merged[field] = "手入力" if field == "source" else ("" if field == "basis_date" else None)
+            if existing:
+                conn.execute(
+                    f"UPDATE pl_entries SET {', '.join(f'{field}=?' for field in fields)} WHERE id=? AND project_id=?",
+                    [*[merged.get(field) for field in fields], existing["id"], project_id],
+                )
+            else:
+                conn.execute(
+                    f"INSERT INTO pl_entries (project_id, {', '.join(fields)}) VALUES (?, {', '.join('?' for _ in fields)})",
+                    [project_id, *[merged.get(field) for field in fields]],
+                )
 
 
 def get_catalyst(project_id: int, db_path: str | Path = DEFAULT_DB_PATH) -> dict | None:
@@ -466,31 +678,74 @@ def save_scenarios(project_id: int, scenarios: list[dict], db_path: str | Path =
 
 def get_segment_entries(project_id: int, db_path: str | Path = DEFAULT_DB_PATH) -> list[dict]:
     with get_connection(db_path) as conn:
-        return [dict(row) for row in conn.execute("""
+        rows = [dict(row) for row in conn.execute("""
             SELECT * FROM segment_entries WHERE project_id=?
             ORDER BY fiscal_year,
                 CASE result_type WHEN '実績' THEN 0 WHEN '会社予想' THEN 1 ELSE 2 END,
                 display_order, segment_name
         """, (project_id,))]
+    for row in rows:
+        row["result_type"] = normalize_result_type(row.get("result_type"))
+    return rows
 
 
 def save_segment_entries(project_id: int, entries: list[dict], db_path: str | Path = DEFAULT_DB_PATH) -> None:
+    """セグメントを行単位で更新し、空表やNoneで既存データを消さない。"""
+    fields = [
+        "fiscal_year", "result_type", "segment_name", "sales", "operating_profit",
+        "source", "note", "display_order", "row_type",
+    ]
+    normalized = []
+    for raw in entries:
+        fiscal_year = str(raw.get("fiscal_year", raw.get("年度")) or "").strip()
+        segment_name = str(raw.get("segment_name", raw.get("セグメント")) or "").strip()
+        if not fiscal_year or not segment_name:
+            continue
+        normalized.append({
+            "id": raw.get("id"),
+            "fiscal_year": fiscal_year,
+            "result_type": normalize_result_type(raw.get("result_type", raw.get("実績／会社予想／自分予想", "実績"))),
+            "segment_name": segment_name,
+            "sales": raw.get("sales", raw.get("売上高（百万円）")),
+            "operating_profit": raw.get("operating_profit", raw.get("営業利益（百万円）")),
+            "source": raw.get("source", raw.get("出典")),
+            "note": raw.get("note", raw.get("メモ")),
+            "display_order": raw.get("display_order", raw.get("表示順")),
+            "row_type": raw.get("row_type", "セグメント"),
+        })
+    if not normalized:
+        return
     with get_connection(db_path) as conn:
-        conn.execute("DELETE FROM segment_entries WHERE project_id=?", (project_id,))
-        conn.executemany("""INSERT INTO segment_entries
-            (project_id, fiscal_year, result_type, segment_name, sales, operating_profit,
-             source, note, display_order, row_type)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", [(project_id,
-                                                  row.get("fiscal_year", row.get("年度")),
-                                                  row.get("result_type", row.get("実績／会社予想／自分予想", "実績")),
-                                                  row.get("segment_name", row.get("セグメント")),
-                                                  row.get("sales", row.get("売上高（百万円）")),
-                                                  row.get("operating_profit", row.get("営業利益（百万円）")),
-                                                  row.get("source", row.get("出典")) or "手入力",
-                                                  row.get("note", row.get("メモ")) or "",
-                                                  int(row.get("display_order", 0) or 0),
-                                                  row.get("row_type", "セグメント") or "セグメント")
-                                                for row in entries])
+        for row in normalized:
+            existing = None
+            if row.get("id") is not None:
+                existing = conn.execute(
+                    "SELECT * FROM segment_entries WHERE id=? AND project_id=?", (row["id"], project_id)
+                ).fetchone()
+            if existing is None:
+                existing = conn.execute(
+                    """SELECT * FROM segment_entries
+                       WHERE project_id=? AND fiscal_year=? AND result_type=? AND segment_name=?""",
+                    (project_id, row["fiscal_year"], row["result_type"], row["segment_name"]),
+                ).fetchone()
+            merged = dict(existing) if existing else {}
+            for field in fields:
+                incoming = row.get(field)
+                if not _is_blank(incoming):
+                    merged[field] = incoming
+                elif field not in merged:
+                    defaults = {"source": "手入力", "note": "", "display_order": 0, "row_type": "セグメント"}
+                    merged[field] = defaults.get(field)
+            if existing:
+                conn.execute(
+                    f"UPDATE segment_entries SET {', '.join(f'{field}=?' for field in fields)} WHERE id=? AND project_id=?",
+                    [*[merged.get(field) for field in fields], existing["id"], project_id],
+                )
+            else:
+                conn.execute(
+                    f"INSERT INTO segment_entries (project_id, {', '.join(fields)}) VALUES (?, {', '.join('?' for _ in fields)})",
+                    [project_id, *[merged.get(field) for field in fields]],
+                )
 
 
 def get_segment_metrics(project_id: int, db_path: str | Path = DEFAULT_DB_PATH) -> list[dict]:
