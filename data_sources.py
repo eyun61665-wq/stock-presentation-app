@@ -101,12 +101,49 @@ def _parse_jsonp(text: str) -> dict | None:
         return None
 
 
+def _fetch_eir_v5_documents(
+    html: str, ir_url: str, session=requests, timeout: int = 20,
+) -> list[dict[str, str]]:
+    """E-IR v5のHTMLに埋め込まれた一覧フィードからPDFを取得する。"""
+    feed_urls = [
+        urljoin(ir_url, match)
+        for match in re.findall(
+            r'<script[^>]+src=["\']([^"\']*eir-parts\.net/[^"\']*/announcement_\d+\.js(?:\?[^"\']*)?)["\']',
+            html,
+            flags=re.I,
+        )
+    ]
+    headers = {"User-Agent": USER_AGENT, "Referer": ir_url}
+    documents: list[dict[str, str]] = []
+    for feed_url in feed_urls:
+        try:
+            response = session.get(feed_url, headers=headers, timeout=timeout)
+            response.raise_for_status()
+        except requests.RequestException:
+            continue
+        payload = _parse_jsonp(_response_text(response))
+        items = payload.get("item", []) if isinstance(payload, dict) else []
+        for item in items:
+            link = str(item.get("link") or "").strip()
+            item_type = str(item.get("type") or item.get("icon") or "").lower()
+            if not link or item_type != "pdf":
+                continue
+            documents.append({
+                "url": urljoin(ir_url, link),
+                "title": str(item.get("title") or link.rsplit("/", 1)[-1]).strip(),
+                "published": str(item.get("published") or item.get("date") or ""),
+            })
+    return documents
+
+
 def _fetch_eir_documents(html: str, ir_url: str, session=requests, timeout: int = 20) -> list[dict[str, str]]:
     """JavaScript表示のE-IR（プロネクサス）から公式PDF一覧を取得する。"""
     # eirCode は一覧HTMLではなく eir.js にだけ定義する企業サイトもある。
-    if "eir-parts.net" not in html and not re.search(r"eir\.js", html, flags=re.I):
+    if "eir-parts.net" not in html and not re.search(r"eir(?:_v5)?\.js", html, flags=re.I):
         return []
-    script_match = re.search(r'<script[^>]+src=["\']([^"\']*eir\.js)["\']', html, flags=re.I)
+    script_match = re.search(
+        r'<script[^>]+src=["\']([^"\']*eir(?:_v5)?\.js)["\']', html, flags=re.I
+    )
     if not script_match:
         return []
     script_url = urljoin(ir_url, script_match.group(1))
@@ -117,11 +154,18 @@ def _fetch_eir_documents(html: str, ir_url: str, session=requests, timeout: int 
         script = _response_text(script_response)
     except requests.RequestException:
         return []
-    code_match = re.search(r'var\s+eirCode\s*=\s*["\'](\d{4,5})["\']', script)
+    code_match = re.search(
+        r'(?:var|const)\s+eirCode\s*=\s*["\'](\d{4,5})["\']', script
+    )
     if not code_match:
         return []
     code = code_match.group(1)[:4]
-    for parts_id in (2, 1, 3, 4):
+    configured_ids = [
+        int(value)
+        for value in re.findall(r'(?:file|area)_tanshin_(\d+)', html, flags=re.I)
+    ]
+    parts_ids = list(dict.fromkeys([*configured_ids, 2, 1, 3, 4]))
+    for parts_id in parts_ids:
         data_url = f"https://ssl4.eir-parts.net/V4Public/EIR/{code}/ja/announcement/announcement_{parts_id}.js"
         try:
             data_response = session.get(data_url, headers=headers, timeout=timeout)
@@ -131,7 +175,11 @@ def _fetch_eir_documents(html: str, ir_url: str, session=requests, timeout: int 
         data = _parse_jsonp(_response_text(data_response))
         items = data.get("item", []) if isinstance(data, dict) else []
         documents = [
-            {"url": str(item.get("link", "")), "title": str(item.get("title", "")).strip()}
+            {
+                "url": str(item.get("link", "")),
+                "title": str(item.get("title", "")).strip(),
+                "published": str(item.get("format_date") or item.get("date") or ""),
+            }
             for item in items
             if item.get("type") == "pdf" and item.get("link")
         ]
@@ -264,6 +312,11 @@ def fetch_ir_documents(ir_url: str, refresh: bool = False, session=requests, tim
             continue
         seen.add(url)
         documents.append({"url": url, "title": document["title"] or url.rsplit("/", 1)[-1]})
+    for document in _fetch_eir_v5_documents(html, ir_url, session=session, timeout=timeout):
+        if document["url"] in seen:
+            continue
+        seen.add(document["url"])
+        documents.append(document)
     for document in _fetch_eir_documents(html, ir_url, session=session, timeout=timeout):
         if document["url"] in seen:
             continue

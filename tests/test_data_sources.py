@@ -61,7 +61,11 @@ def test_eir_code_can_be_loaded_from_external_script(monkeypatch, tmp_path):
         "https://example.test/ir/", refresh=True, session=EirSession()
     )
     assert documents == [
-        {"url": "https://example.test/fy.pdf", "title": "2025年12月期決算短信"}
+        {
+            "url": "https://example.test/fy.pdf",
+            "title": "2025年12月期決算短信",
+            "published": "",
+        }
     ]
 
 
@@ -118,3 +122,35 @@ def test_xj_storage_documents_are_loaded_from_public_json(monkeypatch, tmp_path)
     api_call = session.calls[1]
     assert api_call[1]["params"]["company"] == "AS08899"
     assert api_call[1]["params"]["output"] == "json"
+
+
+def test_eir_v5_direct_announcement_feed_is_loaded(monkeypatch, tmp_path):
+    import data_sources
+
+    monkeypatch.setattr(data_sources, "CACHE_DIR", tmp_path)
+
+    class EirV5Session:
+        def get(self, url, **kwargs):
+            if url == "https://example.test/ir/":
+                return Response(
+                    '<script src="https://ssl4.eir-parts.net/V4Public/eir/6617/ja/'
+                    'announcement/announcement_7.js?gt=123"></script>'
+                )
+            assert "announcement_7.js" in url
+            return Response(
+                'eirCallback({"item":['
+                '{"type":"pdf","link":"https://ssl4.eir-parts.net/doc/6617/tdnet/1/00.pdf",'
+                '"title":"2026年3月期決算短信〔日本基準〕（連結）","published":"2026.04.28"},'
+                '{"type":"html","link":"https://example.test/news", "title":"お知らせ"}'
+                ']});'
+            )
+
+    documents = fetch_ir_documents(
+        "https://example.test/ir/", refresh=True, session=EirV5Session()
+    )
+
+    assert documents == [{
+        "url": "https://ssl4.eir-parts.net/doc/6617/tdnet/1/00.pdf",
+        "title": "2026年3月期決算短信〔日本基準〕（連結）",
+        "published": "2026.04.28",
+    }]

@@ -38,8 +38,11 @@ def select_annual_documents(documents: list[dict[str, str]], max_documents: int 
     selected: list[dict[str, str]] = []
     for document in documents:
         title = " ".join(str(document.get("title", "")).split())
+        # 「第3四半決算」のように「期」を省略する会社表記も四半期資料として除外する。
+        is_interim = bool(re.search(r"第\s*[1-3１-３].{0,3}四半", title)) or "中間" in title
         if (not any(word in title for word in ANNUAL_FINANCIAL_TITLE_WORDS)
-                or any(word in title for word in EXCLUDED_ANNUAL_TITLE_WORDS)):
+                or any(word in title for word in EXCLUDED_ANNUAL_TITLE_WORDS)
+                or is_interim):
             continue
         # 「YYYY年M月期 決算短信・説明資料」「通期決算資料」を許容する。
         # 「2026年2月期決算説明資料」のように「通期」という語がない公式IRもある。
@@ -48,7 +51,7 @@ def select_annual_documents(documents: list[dict[str, str]], max_documents: int 
             r"(?:20\d{2}年|平成\d+年).{0,8}期.*決算(?:短信|説明資料|補足資料|概要)", title
         ):
             continue
-        selected.append({"title": title, "url": document["url"]})
+        selected.append({**document, "title": title, "url": document["url"]})
         if len(selected) >= max_documents:
             break
     return selected

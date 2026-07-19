@@ -79,6 +79,18 @@ def test_select_annual_documents_excludes_quarters_and_forecast_revisions():
     assert [row["url"] for row in select_annual_documents(documents)] == ["fy.pdf", "fy2.pdf"]
 
 
+def test_select_annual_documents_excludes_quarter_title_without_period_suffix():
+    documents = [
+        {"title": "2026年3月期第3四半決算補足資料", "url": "q3.pdf"},
+        {"title": "2026年3月期 決算補足資料", "url": "fy.pdf"},
+        {"title": "2026年3月期決算短信〔日本基準〕（連結）", "url": "tanshin.pdf"},
+    ]
+
+    assert [row["url"] for row in select_annual_documents(documents)] == [
+        "fy.pdf", "tanshin.pdf"
+    ]
+
+
 def test_select_annual_documents_accepts_year_end_title_without_annual_word():
     documents = [
         {"title": "2026年2月期決算短信〔日本基準〕(連結)", "url": "fy.pdf"},
