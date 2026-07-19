@@ -24,13 +24,13 @@ def test_official_description_fills_only_empty_project_fields():
     updated = fill_empty_profile({"business_description": "", "strengths": "手入力済み"}, candidates)
     assert "サイバーセキュリティ教育" in updated["business_description"]
     assert updated["strengths"] == "手入力済み"
-    assert "ガイドライン" in updated["catalysts"]
+    assert updated.get("catalysts", "") == ""
 
 
 def test_profile_has_safe_fallback_when_official_page_is_unavailable():
     candidates = fetch_company_profile("", "テスト製造", "機械")
-    assert candidates["business_description"].startswith("確認候補：")
-    assert "公式資料で確認" in candidates["business_description"]
+    assert candidates["business_description"] == ""
+    assert candidates["strengths"] == ""
 
 
 def test_news_rss_keeps_source_url_and_classifies_rule_change():

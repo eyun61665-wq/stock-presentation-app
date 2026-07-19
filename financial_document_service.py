@@ -261,6 +261,7 @@ def _load_official_financials_with_parser(
     if not documents:
         return {
             "pl_records": [], "segment_records": [], "segment_metrics": [],
+            "company_profile": {}, "catalyst_candidates": [],
             "documents": [], "warnings": ["AI解析対象の本決算資料を見つけられませんでした。"],
         }
     pl_by_key: dict[tuple[str, str], dict[str, Any]] = {}
@@ -268,6 +269,8 @@ def _load_official_financials_with_parser(
     metrics_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
     used_documents: list[dict[str, str]] = []
     warnings: list[str] = []
+    company_profile: dict[str, str] = {}
+    catalyst_candidates: list[dict[str, Any]] = []
     for document in documents:
         try:
             content, _metadata = download_pdf(document["url"], refresh=refresh)
@@ -278,6 +281,14 @@ def _load_official_financials_with_parser(
         if parsed["pl_records"] or parsed["segment_records"] or parsed["segment_metrics"]:
             used_documents.append(document)
         warnings.extend(parsed.get("warnings", []))
+        for field, value in parsed.get("company_profile", {}).items():
+            if value and not company_profile.get(field):
+                company_profile[field] = value
+        known_catalysts = {str(row.get("name")) for row in catalyst_candidates}
+        for candidate in parsed.get("catalyst_candidates", []):
+            if str(candidate.get("name")) not in known_catalysts:
+                catalyst_candidates.append(candidate)
+                known_catalysts.add(str(candidate.get("name")))
         for row in parsed["pl_records"]:
             key = (str(row["fiscal_year"]), str(row.get("result_type", "実績")))
             pl_by_key.setdefault(key, row)
@@ -300,6 +311,8 @@ def _load_official_financials_with_parser(
         "pl_records": [pl_by_key[key] for key in sorted(pl_by_key)],
         "segment_records": [segments_by_key[key] for key in sorted(segments_by_key)],
         "segment_metrics": [metrics_by_key[key] for key in sorted(metrics_by_key)],
+        "company_profile": company_profile,
+        "catalyst_candidates": catalyst_candidates,
         "documents": used_documents,
         "warnings": warnings,
     }

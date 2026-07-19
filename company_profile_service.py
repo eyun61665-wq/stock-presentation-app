@@ -66,7 +66,11 @@ def fetch_company_profile(
     ir_url: str, company_name: str, sector: str = "", *, session=requests, timeout: int = 20,
 ) -> dict[str, str]:
     if not ir_url:
-        return profile_candidates(company_name, sector, "", "")
+        # 業種コードだけから会社固有の説明を作ると誤情報になるため、根拠がなければ空欄にする。
+        return {
+            "business_description": "", "strengths": "", "investment_thesis": "",
+            "catalysts": "", "risks": "",
+        }
     cached = cache_path(ir_url, ".html")
     if cached.exists() and session is requests:
         html = cached.read_text(encoding="utf-8")
@@ -76,7 +80,15 @@ def fetch_company_profile(
         raw = getattr(response, "content", b"")
         html = raw.decode("utf-8", errors="replace") if raw else response.text
     description = _meta_content(html, "description") or _meta_content(html, "og:description")
-    return profile_candidates(company_name, sector, description, ir_url)
+    if not description:
+        return {
+            "business_description": "", "strengths": "", "investment_thesis": "",
+            "catalysts": "", "risks": "",
+        }
+    return {
+        "business_description": f"公式サイト記載：{description}\n出典：{ir_url}",
+        "strengths": "", "investment_thesis": "", "catalysts": "", "risks": "",
+    }
 
 
 def fill_empty_profile(project: dict[str, Any], candidates: dict[str, str]) -> dict[str, Any]:

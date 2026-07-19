@@ -361,6 +361,13 @@ def enrich_project_profile(project_id: int, project: dict) -> dict:
     ir_url = str(current.get("ir_url") or "").strip()
     verified_ir_url = VERIFIED_IR_SOURCES.get(stock_code, "")
     source_changed = bool(verified_ir_url and ir_url and ir_url != verified_ir_url)
+    # 旧版が業種コードなどから作った根拠のない候補文は引き継がない。
+    legacy_auto_prefixes = (
+        "確認候補：", "検討候補：", "検討仮説：", "候補：", "主な確認リスク：",
+    )
+    for field in ("business_description", "strengths", "investment_thesis", "catalysts", "risks"):
+        if str(current.get(field) or "").startswith(legacy_auto_prefixes):
+            current[field] = ""
     if verified_ir_url:
         ir_url = verified_ir_url
     elif stock_code and company_name and not ir_url:
@@ -479,6 +486,19 @@ def merge_financial_previews(primary: dict, supplement: dict) -> dict:
         )
         metric_by_key.setdefault(key, dict(row))
     merged["segment_metrics"] = [metric_by_key[key] for key in sorted(metric_by_key)]
+
+    profile = dict(primary.get("company_profile") or {})
+    for field, value in (supplement.get("company_profile") or {}).items():
+        if value and not profile.get(field):
+            profile[field] = value
+    merged["company_profile"] = profile
+    catalysts = [*primary.get("catalyst_candidates", [])]
+    known_names = {str(row.get("name")) for row in catalysts}
+    for candidate in supplement.get("catalyst_candidates", []):
+        if str(candidate.get("name")) not in known_names:
+            catalysts.append(candidate)
+            known_names.add(str(candidate.get("name")))
+    merged["catalyst_candidates"] = catalysts
 
     documents = [*primary.get("documents", []), *supplement.get("documents", [])]
     merged["documents"] = list({(row.get("title"), row.get("url")): row for row in documents}.values())
@@ -1005,6 +1025,10 @@ def _uploaded_financial_result(files: list) -> dict:
 
 def _financial_result_needs_ai(result: dict, location: str) -> bool:
     """通常解析で対象画面の主要項目が不足しているか判定する。"""
+    # Geminiは数値の不足補完だけでなく、同じ公式PDFから企業概要と
+    # カタリスト根拠も抽出する。結果がなければ一度だけ（24時間キャッシュ）呼ぶ。
+    if not result.get("company_profile"):
+        return True
     if location == "segment":
         return not result.get("segment_records")
     actual = [row for row in result.get("pl_records", []) if row.get("result_type", "実績") == "実績"]
@@ -1015,6 +1039,13 @@ def _financial_result_needs_ai(result: dict, location: str) -> bool:
         "ordinary_profit", "pretax_profit", "net_income",
     )
     return any(any(row.get(field) is None for field in detail_fields) for row in actual)
+
+
+def _has_ai_extraction(result: dict) -> bool:
+    return any(result.get(key) for key in (
+        "pl_records", "segment_records", "segment_metrics",
+        "company_profile", "catalyst_candidates",
+    ))
 
 
 def _uploaded_ai_result(files: list, model: str) -> dict:
@@ -1043,6 +1074,30 @@ def _uploaded_gemini_result(files: list, model: str) -> dict:
 
 def _apply_financial_result(project_id: int, result: dict, location: str) -> int:
     """取得結果のうち、開いている画面の表だけをSQLiteへ反映する。"""
+    project = get_project(project_id) or {"id": project_id}
+    profile = result.get("company_profile") or {}
+    auto_prefixes = ("確認候補：", "検討候補：", "検討仮説：", "候補：", "主な確認リスク：", "Gemini要約", "Gemini分析候補")
+    changed = False
+    for field in ("business_description", "strengths", "investment_thesis", "catalysts", "risks"):
+        current_value = str(project.get(field) or "").strip()
+        new_value = str(profile.get(field) or "").strip()
+        if new_value and (not current_value or current_value.startswith(auto_prefixes)):
+            project[field] = new_value
+            changed = True
+    candidates = result.get("catalyst_candidates") or []
+    if candidates and (not str(project.get("catalysts") or "").strip() or str(project.get("catalysts") or "").startswith(auto_prefixes)):
+        lines = []
+        for row in candidates[:5]:
+            impact = f"／会社への影響：{row.get('company_impact')}" if row.get("company_impact") else ""
+            lines.append(
+                f"・{row.get('name')}：{row.get('rationale')}{impact}"
+                f"（確度：{row.get('confidence', '低')}、出典：{row.get('source', '')}）"
+            )
+        project["catalysts"] = "Gemini分析候補（要確認）\n" + "\n".join(lines)
+        changed = True
+    if changed:
+        project["id"] = project_id
+        save_project(project)
     if location == "pl":
         records = select_recent_pl_records(result.get("pl_records", []), 3)
         if not records:
@@ -1181,9 +1236,10 @@ def financial_document_import_panel(project: dict, location: str) -> None:
                                 source_info["url"], get_gemini_financial_model(), 3, nonce,
                             )
                             result = merge_financial_previews(result, gemini_result)
-                            result.setdefault("warnings", []).append(
-                                "通常解析で不足した項目をGemini無料枠で補助抽出しました。出典ページを確認してください。"
-                            )
+                            if _has_ai_extraction(gemini_result):
+                                result.setdefault("warnings", []).append(
+                                    "Geminiが公式資料から根拠付きの不足項目を補完しました。出典ページを確認してください。"
+                                )
                         except GeminiFinancialParserError as gemini_exc:
                             result.setdefault("warnings", []).append(str(gemini_exc))
                     if use_paid_ai and _financial_result_needs_ai(result, location):
@@ -1257,13 +1313,12 @@ def financial_document_import_panel(project: dict, location: str) -> None:
                 result = _uploaded_financial_result(uploaded)
                 if gemini_available and _financial_result_needs_ai(result, location):
                     try:
-                        result = merge_financial_previews(
-                            result,
-                            _uploaded_gemini_result(uploaded, get_gemini_financial_model()),
-                        )
-                        result.setdefault("warnings", []).append(
-                            "通常解析で不足した項目をGemini無料枠で補助抽出しました。出典ページを確認してください。"
-                        )
+                        gemini_result = _uploaded_gemini_result(uploaded, get_gemini_financial_model())
+                        result = merge_financial_previews(result, gemini_result)
+                        if _has_ai_extraction(gemini_result):
+                            result.setdefault("warnings", []).append(
+                                "GeminiがPDFから根拠付きの不足項目を補完しました。出典ページを確認してください。"
+                            )
                     except GeminiFinancialParserError as gemini_exc:
                         result.setdefault("warnings", []).append(str(gemini_exc))
                 if use_paid_ai and _financial_result_needs_ai(result, location):
@@ -1342,6 +1397,21 @@ def project_page() -> None:
         ]
         for column, label, value in zip(cards, ["株価", "時価総額", "PER", "PBR", "配当利回り"], values):
             column.metric(label, value, border=True)
+        if project:
+            price_date = str(project.get("price_date") or "未設定")
+            price_source = str(project.get("price_source") or "手入力")
+            shares_source = str(project.get("shares_source") or "手入力")
+            st.caption(
+                f"株価基準日：{price_date} ｜ 株価出典：{price_source} ｜ "
+                f"株式数：{shares_source}"
+            )
+            if price_date != "未設定":
+                try:
+                    age_days = (pd.Timestamp.now(tz="Asia/Tokyo").date() - pd.Timestamp(price_date).date()).days
+                    if age_days > 7:
+                        st.warning("株価基準日が7日以上前です。現在値ではなく、取得可能な直近終値として確認してください。")
+                except (TypeError, ValueError):
+                    pass
         if project and project.get("ir_url"):
             st.caption("決算短信の取得先は銘柄コードから自動設定済みです。PL・セグメント画面で再取得できます。")
         business = st.text_area("事業内容", value=project.get("business_description", "") if project else "", height=90, key=f"project_form_business_{form_suffix}")

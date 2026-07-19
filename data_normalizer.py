@@ -40,9 +40,10 @@ def normalize_master_row(row: dict) -> dict:
     return {"code": normalize_code(code), "stock_code": display_code(code),
             "company_name": value_of(row, "CoName", "CompanyName", "company_name") or "",
             "company_name_en": value_of(row, "CoNameEn", "CompanyNameEnglish", "company_name_en") or "",
-            "market": value_of(row, "Mkt", "MarketCode", "MarketSegment") or "",
-            "sector17": value_of(row, "S17", "Sector17Code") or "",
-            "sector33": value_of(row, "S33", "Sector33Code") or ""}
+            # V2ではコードと名称が別フィールドの場合がある。文章生成には名称を優先する。
+            "market": value_of(row, "MktNm", "MarketName", "MarketSegment", "Mkt", "MarketCode") or "",
+            "sector17": value_of(row, "S17Nm", "Sector17Name", "Sector17", "S17", "Sector17Code") or "",
+            "sector33": value_of(row, "S33Nm", "Sector33Name", "Sector33", "S33", "Sector33Code") or ""}
 
 
 def canonical_company_name(value: str) -> str:

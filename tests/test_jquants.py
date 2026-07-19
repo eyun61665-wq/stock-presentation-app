@@ -4,7 +4,7 @@ import requests
 from company_data_service import (build_company_forecast_record, build_pl_import_records, fetch_company_data,
                                   find_companies, find_project_by_code,
                                   should_show_no_results)
-from data_normalizer import (extract_latest_fy_records, extract_latest_forecast, normalize_code,
+from data_normalizer import (extract_latest_fy_records, extract_latest_forecast, normalize_code, normalize_master_row,
                              normalize_financial_record, search_companies, to_million_shares, to_million_yen)
 from jquants_client import JQuantsApiError, JQuantsClient
 
@@ -48,6 +48,16 @@ def test_code_normalization_and_company_name_search():
     assert normalize_code("72030") == "72030"
     assert search_companies(MASTER, "トヨタ")[0]["stock_code"] == "7203"
     assert search_companies(MASTER, "7267")[0]["company_name"] == "ホンダ"
+
+
+def test_master_prefers_sector_and_market_names_over_numeric_codes():
+    row = normalize_master_row({
+        "Code": "66170", "CoName": "東光高岳", "Mkt": "0111", "MktNm": "プライム",
+        "S17": "6", "S17Nm": "電機・精密", "S33": "3650", "S33Nm": "電気機器",
+    })
+    assert row["market"] == "プライム"
+    assert row["sector17"] == "電機・精密"
+    assert row["sector33"] == "電気機器"
 
 
 def test_japanese_company_search_handles_spaces_and_corporate_form_without_exception():

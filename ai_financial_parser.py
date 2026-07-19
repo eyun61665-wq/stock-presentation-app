@@ -89,9 +89,43 @@ FINANCIAL_SCHEMA: dict[str, Any] = {
                 ],
             },
         },
+        "company_profile": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "business_description": {"type": "string"},
+                "strengths": {"type": "string"},
+                "investment_thesis": {"type": "string"},
+                "catalysts": {"type": "string"},
+                "risks": {"type": "string"},
+                "source_page": {"type": ["integer", "null"]},
+            },
+            "required": [
+                "business_description", "strengths", "investment_thesis",
+                "catalysts", "risks", "source_page",
+            ],
+        },
+        "catalyst_candidates": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "name": {"type": "string"},
+                    "rationale": {"type": "string"},
+                    "company_impact": {"type": "string"},
+                    "confidence": {"type": "string", "enum": ["高", "中", "低"]},
+                    "source_page": {"type": ["integer", "null"]},
+                },
+                "required": ["name", "rationale", "company_impact", "confidence", "source_page"],
+            },
+        },
         "warnings": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["pl_records", "segment_records", "segment_metrics", "warnings"],
+    "required": [
+        "pl_records", "segment_records", "segment_metrics", "company_profile",
+        "catalyst_candidates", "warnings",
+    ],
 }
 
 
@@ -111,6 +145,16 @@ PROMPT = """
 - row_label は画面にそのまま表示できる日本語名、unit は「社」「件」「円」「%」など資料記載の単位。
 - source_page はPDFの1始まりページ番号。根拠ページを確認できなければ null。
 - fiscal_year は可能なら YYYY-MM-DD。資料が年月だけなら資料の表記を維持する。
+""".strip()
+
+PROMPT += """
+
+追加抽出ルール:
+- company_profile.business_description は、この会社が何を販売・提供しているかを資料の記載だけで簡潔に要約する。業種コードや一般論から作らない。
+- strengths、investment_thesis、catalysts、risks は資料で確認できる事実を根拠にする。根拠が弱い場合は空文字にする。
+- catalyst_candidates は資料に明記された設備投資、新製品、受注、価格改定、中期計画、制度対応などだけを候補にする。
+- company_impact は売上、利益率、投資負担、競争力のどれにどう影響するかを書く。株価上昇率や未開示の金額を推測しない。
+- 会社固有の根拠が確認できない文章や数値は空文字または null にする。
 """.strip()
 
 
@@ -137,6 +181,8 @@ def normalize_ai_result(
         "pl_records": [],
         "segment_records": [],
         "segment_metrics": [],
+        "company_profile": {},
+        "catalyst_candidates": [],
         "warnings": [str(item) for item in payload.get("warnings", [])],
         "documents": [{"title": filename, "url": source_url}],
     }
@@ -194,6 +240,32 @@ def normalize_ai_result(
             "display_order": int(raw.get("display_order") or 0),
             "source": _source_label(filename, page).replace("AI解析", source_prefix, 1),
             "note": source_url,
+        })
+
+    profile = payload.get("company_profile") or {}
+    page = profile.get("source_page")
+    citation = f"出典：{filename}" + (f" p.{page}" if page else "")
+    if source_url:
+        citation += f" {source_url}"
+    for field in ("business_description", "strengths", "investment_thesis", "catalysts", "risks"):
+        value = str(profile.get(field) or "").strip()
+        if value:
+            label = "Gemini要約（要確認）" if field == "business_description" else "Gemini分析候補（要確認）"
+            result["company_profile"][field] = f"{label}：{value}\n{citation}"
+
+    for raw in payload.get("catalyst_candidates", []):
+        name = str(raw.get("name") or "").strip()
+        rationale = str(raw.get("rationale") or "").strip()
+        if not name or not rationale:
+            continue
+        candidate_page = raw.get("source_page")
+        result["catalyst_candidates"].append({
+            "name": name,
+            "rationale": rationale,
+            "company_impact": str(raw.get("company_impact") or "").strip(),
+            "confidence": str(raw.get("confidence") or "低"),
+            "source": f"{filename}" + (f" p.{candidate_page}" if candidate_page else ""),
+            "source_url": source_url,
         })
     return result
 
