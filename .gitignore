@@ -18,3 +18,4 @@ test_run_tmp*/
 *.db-journal
 *.db-shm
 *.db-wal
+backup/

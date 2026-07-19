@@ -1,6 +1,7 @@
 """SQLite永続化と、旧単位（株・小数％）からの互換マイグレーション。"""
 from __future__ import annotations
 
+import json
 import shutil
 import sqlite3
 from datetime import datetime
@@ -8,7 +9,7 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = BASE_DIR / "stock_projects.db"
-SCHEMA_VERSION = "10"
+SCHEMA_VERSION = "11"
 API_PROJECT_COLUMNS = {
     "company_name_en": "TEXT DEFAULT ''", "market": "TEXT DEFAULT ''", "sector17": "TEXT DEFAULT ''",
     "sector33": "TEXT DEFAULT ''", "price_date": "TEXT DEFAULT ''", "data_retrieved_at": "TEXT DEFAULT ''",
@@ -22,9 +23,14 @@ TABLE_MIGRATION_COLUMNS = {
         "ordinary_profit": "REAL", "non_operating_income": "REAL",
         "non_operating_expenses": "REAL", "extraordinary_income": "REAL",
         "extraordinary_loss": "REAL", "pretax_profit": "REAL", "income_taxes": "REAL",
+        "reported_eps": "REAL",
         "source": "TEXT DEFAULT '手入力'", "basis_date": "TEXT DEFAULT ''",
     },
-    "segment_entries": {"result_type": "TEXT DEFAULT '実績'"},
+    "segment_entries": {
+        "result_type": "TEXT DEFAULT '実績'",
+        "display_order": "INTEGER DEFAULT 0",
+        "row_type": "TEXT DEFAULT 'セグメント'",
+    },
     "catalysts": {
         "calculation_method": "TEXT DEFAULT '数量モデル'",
         "base_sales": "REAL",
@@ -51,7 +57,9 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
 
 def _backup_database(db_path: Path) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup = db_path.with_name(f"{db_path.stem}_before_unit_migration_{timestamp}{db_path.suffix}")
+    backup_dir = db_path.parent / "backup" / timestamp
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup = backup_dir / db_path.name
     shutil.copy2(db_path, backup)
     return backup
 
@@ -63,6 +71,7 @@ def initialize_database(db_path: str | Path = DEFAULT_DB_PATH) -> None:
     needs_table_columns = False
     needs_forecast_schema = False
     needs_segment_metrics_table = False
+    needs_mvp_table = False
     if path.exists():
         with get_connection(path) as conn:
             legacy = _table_exists(conn, "projects") and not _table_exists(conn, "app_metadata")
@@ -82,7 +91,9 @@ def initialize_database(db_path: str | Path = DEFAULT_DB_PATH) -> None:
                     existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
                     needs_table_columns = needs_table_columns or bool(set(columns) - existing)
             needs_segment_metrics_table = not _table_exists(conn, "segment_metrics")
-        if legacy or needs_api_columns or needs_table_columns or needs_forecast_schema or needs_segment_metrics_table:
+            needs_mvp_table = not _table_exists(conn, "project_mvp_data")
+        if (legacy or needs_api_columns or needs_table_columns or needs_forecast_schema
+                or needs_segment_metrics_table or needs_mvp_table):
             _backup_database(path)
 
     with get_connection(path) as conn:
@@ -148,6 +159,17 @@ def initialize_database(db_path: str | Path = DEFAULT_DB_PATH) -> None:
                 FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
                 UNIQUE(project_id, fiscal_year, result_type, row_label)
             );
+            CREATE TABLE IF NOT EXISTS project_mvp_data (
+                project_id INTEGER PRIMARY KEY,
+                schema_version INTEGER NOT NULL DEFAULT 1,
+                overview_json TEXT NOT NULL DEFAULT '{}',
+                settings_json TEXT NOT NULL DEFAULT '{}',
+                kpi_json TEXT NOT NULL DEFAULT '{}',
+                catalyst_json TEXT NOT NULL DEFAULT '{}',
+                memo_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+            );
         """)
         if legacy:
             _migrate_legacy_units(conn)
@@ -166,60 +188,85 @@ def initialize_database(db_path: str | Path = DEFAULT_DB_PATH) -> None:
 
 
 def _migrate_forecast_tables(conn: sqlite3.Connection) -> None:
-    """同一年度の会社予想・自分予想と、予想の空欄保存に対応する。"""
-    conn.executescript("""
-        CREATE TABLE pl_entries_v7 (
+    """旧表を削除せず退避し、同一年度に複数区分を保存できる表へ移行する。"""
+    suffix = datetime.now().strftime("%Y%m%d%H%M%S")
+    old_pl = f"pl_entries_legacy_{suffix}"
+    old_segment = f"segment_entries_legacy_{suffix}"
+
+    conn.execute(f"ALTER TABLE pl_entries RENAME TO {old_pl}")
+    conn.execute("""
+        CREATE TABLE pl_entries (
             id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL,
             fiscal_year TEXT NOT NULL, result_type TEXT NOT NULL,
             sales REAL, operating_profit REAL, net_income REAL, shares_outstanding REAL,
             cost_of_sales REAL, gross_profit REAL, sga_expenses REAL,
             ordinary_profit REAL, non_operating_income REAL, non_operating_expenses REAL,
             extraordinary_income REAL, extraordinary_loss REAL, pretax_profit REAL,
-            income_taxes REAL, source TEXT DEFAULT '手入力', basis_date TEXT DEFAULT '',
+            income_taxes REAL, reported_eps REAL, source TEXT DEFAULT '手入力', basis_date TEXT DEFAULT '',
             FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
             UNIQUE(project_id, fiscal_year, result_type)
-        );
-        INSERT INTO pl_entries_v7 (
+        )
+    """)
+    old_pl_columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({old_pl})")}
+    reported_eps = "reported_eps" if "reported_eps" in old_pl_columns else "NULL"
+    conn.execute(f"""
+        INSERT INTO pl_entries (
             id, project_id, fiscal_year, result_type, sales, operating_profit, net_income,
             shares_outstanding, cost_of_sales, gross_profit, sga_expenses, ordinary_profit,
             non_operating_income, non_operating_expenses, extraordinary_income,
-            extraordinary_loss, pretax_profit, income_taxes, source, basis_date
+            extraordinary_loss, pretax_profit, income_taxes, reported_eps, source, basis_date
         )
         SELECT id, project_id, fiscal_year, COALESCE(NULLIF(result_type, ''), '実績'),
             sales, operating_profit, net_income, shares_outstanding, cost_of_sales,
             gross_profit, sga_expenses, ordinary_profit, non_operating_income,
             non_operating_expenses, extraordinary_income, extraordinary_loss,
-            pretax_profit, income_taxes, source, basis_date
-        FROM pl_entries;
-        DROP TABLE pl_entries;
-        ALTER TABLE pl_entries_v7 RENAME TO pl_entries;
+            pretax_profit, income_taxes, {reported_eps}, source, basis_date
+        FROM {old_pl}
+    """)
 
-        CREATE TABLE segment_entries_v7 (
+    conn.execute(f"ALTER TABLE segment_entries RENAME TO {old_segment}")
+    conn.execute("""
+        CREATE TABLE segment_entries (
             id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL,
             fiscal_year TEXT NOT NULL, result_type TEXT DEFAULT '実績', segment_name TEXT NOT NULL,
             sales REAL, operating_profit REAL, source TEXT DEFAULT '手入力', note TEXT DEFAULT '',
+            display_order INTEGER DEFAULT 0, row_type TEXT DEFAULT 'セグメント',
             FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
             UNIQUE(project_id, fiscal_year, result_type, segment_name)
-        );
-        INSERT INTO segment_entries_v7 (
+        )
+    """)
+    old_segment_columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({old_segment})")}
+    display_order = "display_order" if "display_order" in old_segment_columns else "0"
+    row_type = "row_type" if "row_type" in old_segment_columns else "'セグメント'"
+    conn.execute(f"""
+        INSERT INTO segment_entries (
             id, project_id, fiscal_year, result_type, segment_name, sales,
-            operating_profit, source, note
+            operating_profit, source, note, display_order, row_type
         )
         SELECT id, project_id, fiscal_year, COALESCE(NULLIF(result_type, ''), '実績'),
-            segment_name, sales, operating_profit, source, note
-        FROM segment_entries;
-        DROP TABLE segment_entries;
-        ALTER TABLE segment_entries_v7 RENAME TO segment_entries;
+            segment_name, sales, operating_profit, source, note, {display_order}, {row_type}
+        FROM {old_segment}
     """)
 
 
 def _migrate_legacy_units(conn: sqlite3.Connection) -> None:
     """旧アプリの株数（株）・率（小数）を新しい単位へ一度だけ変換する。"""
-    conn.execute("UPDATE projects SET shares_outstanding = shares_outstanding / 1000000.0 WHERE shares_outstanding <> 0")
-    conn.execute("UPDATE pl_entries SET shares_outstanding = shares_outstanding / 1000000.0 WHERE shares_outstanding <> 0")
-    conn.execute("UPDATE scenarios SET shares_outstanding = shares_outstanding / 1000000.0 WHERE shares_outstanding <> 0")
-    conn.execute("UPDATE scenarios SET existing_sales_growth_rate = existing_sales_growth_rate * 100, operating_margin_rate = operating_margin_rate * 100, effective_tax_rate = effective_tax_rate * 100")
-    if _table_exists(conn, "catalyst_variables"):
+    def has_column(table: str, column: str) -> bool:
+        return _table_exists(conn, table) and column in {
+            row["name"] for row in conn.execute(f"PRAGMA table_info({table})")
+        }
+
+    if has_column("projects", "shares_outstanding"):
+        conn.execute("UPDATE projects SET shares_outstanding = shares_outstanding / 1000000.0 WHERE shares_outstanding <> 0")
+    if has_column("pl_entries", "shares_outstanding"):
+        conn.execute("UPDATE pl_entries SET shares_outstanding = shares_outstanding / 1000000.0 WHERE shares_outstanding <> 0")
+    if has_column("scenarios", "shares_outstanding"):
+        conn.execute("UPDATE scenarios SET shares_outstanding = shares_outstanding / 1000000.0 WHERE shares_outstanding <> 0")
+    if all(has_column("scenarios", column) for column in (
+        "existing_sales_growth_rate", "operating_margin_rate", "effective_tax_rate"
+    )):
+        conn.execute("UPDATE scenarios SET existing_sales_growth_rate = existing_sales_growth_rate * 100, operating_margin_rate = operating_margin_rate * 100, effective_tax_rate = effective_tax_rate * 100")
+    if has_column("catalyst_variables", "position") and has_column("catalyst_variables", "value"):
         rows = conn.execute("SELECT project_id, position, value, evidence_category, source, note FROM catalyst_variables ORDER BY project_id, position").fetchall()
         by_project: dict[int, dict[int, sqlite3.Row]] = {}
         for row in rows:
@@ -264,6 +311,82 @@ def delete_project(project_id: int, db_path: str | Path = DEFAULT_DB_PATH) -> No
         conn.execute("DELETE FROM projects WHERE id=?", (project_id,))
 
 
+def rename_project(project_id: int, project_name: str, db_path: str | Path = DEFAULT_DB_PATH) -> None:
+    name = str(project_name or "").strip()
+    if not name:
+        raise ValueError("プロジェクト名を入力してください。")
+    with get_connection(db_path) as conn:
+        conn.execute(
+            "UPDATE projects SET project_name=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (name, project_id),
+        )
+
+
+MVP_DATA_DEFAULTS = {
+    "overview": {},
+    "settings": {"pl_unit": "百万円", "segment_unit": "百万円", "period_labels": {}},
+    "kpi": {"kpis": [], "revenue_items": [], "profit_method": {}},
+    "catalyst": {},
+    "memo": {},
+}
+
+
+def get_project_mvp_data(project_id: int, db_path: str | Path = DEFAULT_DB_PATH) -> dict:
+    with get_connection(db_path) as conn:
+        row = conn.execute("SELECT * FROM project_mvp_data WHERE project_id=?", (project_id,)).fetchone()
+    result = {key: dict(value) for key, value in MVP_DATA_DEFAULTS.items()}
+    result["schema_version"] = 1
+    if not row:
+        return result
+    for key in MVP_DATA_DEFAULTS:
+        try:
+            loaded = json.loads(row[f"{key}_json"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            loaded = {}
+        result[key] = loaded if isinstance(loaded, dict) else dict(MVP_DATA_DEFAULTS[key])
+    result["schema_version"] = int(row["schema_version"] or 1)
+    result["updated_at"] = row["updated_at"]
+    return result
+
+
+def save_project_mvp_data(
+    project_id: int,
+    *,
+    overview: dict | None = None,
+    settings: dict | None = None,
+    kpi: dict | None = None,
+    catalyst: dict | None = None,
+    memo: dict | None = None,
+    db_path: str | Path = DEFAULT_DB_PATH,
+) -> None:
+    """MVP拡張データを1トランザクションで保存する。"""
+    current = get_project_mvp_data(project_id, db_path)
+    values = {
+        "overview": current["overview"] if overview is None else overview,
+        "settings": current["settings"] if settings is None else settings,
+        "kpi": current["kpi"] if kpi is None else kpi,
+        "catalyst": current["catalyst"] if catalyst is None else catalyst,
+        "memo": current["memo"] if memo is None else memo,
+    }
+    encoded = [json.dumps(values[key], ensure_ascii=False) for key in MVP_DATA_DEFAULTS]
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """INSERT INTO project_mvp_data
+               (project_id, schema_version, overview_json, settings_json, kpi_json,
+                catalyst_json, memo_json, updated_at)
+               VALUES (?, 1, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+               ON CONFLICT(project_id) DO UPDATE SET
+                 schema_version=excluded.schema_version,
+                 overview_json=excluded.overview_json,
+                 settings_json=excluded.settings_json,
+                 kpi_json=excluded.kpi_json,
+                 catalyst_json=excluded.catalyst_json,
+                 memo_json=excluded.memo_json,
+                 updated_at=CURRENT_TIMESTAMP""",
+            (project_id, *encoded),
+        )
+
+
 def get_pl_entries(project_id: int, db_path: str | Path = DEFAULT_DB_PATH) -> list[dict]:
     with get_connection(db_path) as conn:
         return [dict(row) for row in conn.execute("""
@@ -279,7 +402,7 @@ def save_pl_entries(project_id: int, entries: list[dict], db_path: str | Path = 
         "shares_outstanding", "cost_of_sales", "gross_profit", "sga_expenses",
         "ordinary_profit", "non_operating_income", "non_operating_expenses",
         "extraordinary_income", "extraordinary_loss", "pretax_profit", "income_taxes",
-        "source", "basis_date",
+        "reported_eps", "source", "basis_date",
     ]
     labels = {
         "fiscal_year": "年度", "result_type": "実績／会社予想／自分予想",
@@ -290,6 +413,7 @@ def save_pl_entries(project_id: int, entries: list[dict], db_path: str | Path = 
         "non_operating_income": "営業外収益（百万円）", "non_operating_expenses": "営業外費用（百万円）",
         "extraordinary_income": "特別利益（百万円）", "extraordinary_loss": "特別損失（百万円）",
         "pretax_profit": "税引前利益（百万円）", "income_taxes": "法人税等（百万円）",
+        "reported_eps": "EPS（円）",
         "source": "出典", "basis_date": "基準日",
     }
 
@@ -346,7 +470,7 @@ def get_segment_entries(project_id: int, db_path: str | Path = DEFAULT_DB_PATH) 
             SELECT * FROM segment_entries WHERE project_id=?
             ORDER BY fiscal_year,
                 CASE result_type WHEN '実績' THEN 0 WHEN '会社予想' THEN 1 ELSE 2 END,
-                segment_name
+                display_order, segment_name
         """, (project_id,))]
 
 
@@ -354,15 +478,18 @@ def save_segment_entries(project_id: int, entries: list[dict], db_path: str | Pa
     with get_connection(db_path) as conn:
         conn.execute("DELETE FROM segment_entries WHERE project_id=?", (project_id,))
         conn.executemany("""INSERT INTO segment_entries
-            (project_id, fiscal_year, result_type, segment_name, sales, operating_profit, source, note)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""", [(project_id,
+            (project_id, fiscal_year, result_type, segment_name, sales, operating_profit,
+             source, note, display_order, row_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", [(project_id,
                                                   row.get("fiscal_year", row.get("年度")),
                                                   row.get("result_type", row.get("実績／会社予想／自分予想", "実績")),
                                                   row.get("segment_name", row.get("セグメント")),
                                                   row.get("sales", row.get("売上高（百万円）")),
                                                   row.get("operating_profit", row.get("営業利益（百万円）")),
                                                   row.get("source", row.get("出典")) or "手入力",
-                                                  row.get("note", row.get("メモ")) or "")
+                                                  row.get("note", row.get("メモ")) or "",
+                                                  int(row.get("display_order", 0) or 0),
+                                                  row.get("row_type", "セグメント") or "セグメント")
                                                 for row in entries])
 
 

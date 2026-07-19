@@ -155,4 +155,38 @@ def test_legacy_database_is_backed_up_and_units_are_migrated(tmp_path):
     assert get_project(1, db_path)["shares_outstanding"] == 10
     assert get_pl_entries(1, db_path)[0]["shares_outstanding"] == 10
     assert get_scenarios(1, db_path)[0]["operating_margin_rate"] == 10
-    assert list(tmp_path.glob("legacy_before_unit_migration_*.db"))
+    assert list((tmp_path / "backup").glob("*/legacy.db"))
+def test_mvp_json_data_is_saved_reloaded_and_existing_project_is_kept(tmp_path):
+    from database import get_project_mvp_data, initialize_database, save_project, save_project_mvp_data
+
+    db = tmp_path / "mvp.db"
+    initialize_database(db)
+    project_id = save_project({"project_name": "既存", "company_name": "会社"}, db)
+    save_project_mvp_data(
+        project_id,
+        overview={"main_business": "電力機器"},
+        kpi={"kpis": [{"kpi_name": "台数"}], "revenue_items": []},
+        db_path=db,
+    )
+    loaded = get_project_mvp_data(project_id, db)
+    assert loaded["overview"]["main_business"] == "電力機器"
+    assert loaded["kpi"]["kpis"][0]["kpi_name"] == "台数"
+    assert save_project({"id": project_id, "project_name": "既存", "company_name": "会社"}, db) == project_id
+
+
+def test_migration_adds_mvp_table_without_dropping_existing_rows(tmp_path):
+    import sqlite3
+    from database import initialize_database
+
+    db = tmp_path / "legacy_mvp.db"
+    con = sqlite3.connect(db)
+    con.executescript("""
+        CREATE TABLE projects (id INTEGER PRIMARY KEY, project_name TEXT NOT NULL);
+        INSERT INTO projects VALUES (1, '保持対象');
+    """)
+    con.close()
+    initialize_database(db)
+    con = sqlite3.connect(db)
+    assert con.execute("SELECT project_name FROM projects WHERE id=1").fetchone()[0] == "保持対象"
+    assert con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='project_mvp_data'").fetchone()
+    con.close()
